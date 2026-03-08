@@ -748,8 +748,21 @@ class GraphBuilder:
             callee_str = _dotted_name(callee)
 
             if callee_str is None:
-                # Complex expression — emit generic unresolved symbol
-                self._emit_calls_symbol(func_nid, SCOPE_LOCAL, "<dynamic>")
+                # Check for super().method() — Attribute(value=Call(super), attr=method)
+                super_resolved = None
+                if (
+                    isinstance(callee, ast.Attribute)
+                    and isinstance(callee.value, ast.Call)
+                    and isinstance(callee.value.func, ast.Name)
+                    and callee.value.func.id == "super"
+                    and enclosing_class
+                ):
+                    cls_nid = self._class_id(module_name, enclosing_class)
+                    super_resolved = self._lookup_method_in_parents(cls_nid, callee.attr)
+                if super_resolved:
+                    self._add_edge(func_nid, ET_CALLS, super_resolved)
+                else:
+                    self._emit_calls_symbol(func_nid, SCOPE_LOCAL, "<dynamic>")
                 continue
 
             parts = callee_str.split(".")
