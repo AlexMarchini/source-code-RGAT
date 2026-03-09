@@ -40,6 +40,12 @@ def main(argv: list[str] | None = None) -> None:
         default=Path("graph.json"),
         help="Output JSON file path (default: graph.json).",
     )
+    parser.add_argument(
+        "--no-features",
+        action="store_true",
+        default=False,
+        help="Skip node feature computation (topology-only output).",
+    )
     args = parser.parse_args(argv)
 
     repo_root: Path = args.repo_root.resolve()
@@ -50,7 +56,8 @@ def main(argv: list[str] | None = None) -> None:
     # Import here so --help stays fast and doesn't trigger ast parsing
     from graph_builder.builder import GraphBuilder
 
-    builder = GraphBuilder(repo_root=repo_root, repo_name=args.repo_name)
+    builder = GraphBuilder(repo_root=repo_root, repo_name=args.repo_name,
+                           compute_features=not args.no_features)
     # Jedi is enabled automatically by GraphBuilder if installed.
     graph = builder.build()
     graph.write_json(args.out)

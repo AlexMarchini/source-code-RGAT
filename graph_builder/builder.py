@@ -94,9 +94,10 @@ class GraphBuilder:
         Short human-readable name used in node IDs (e.g. ``"my_project"``).
     """
 
-    def __init__(self, repo_root: Path, repo_name: str) -> None:
+    def __init__(self, repo_root: Path, repo_name: str, *, compute_features: bool = True) -> None:
         self.repo_root = Path(repo_root).resolve()
         self.repo_name = repo_name
+        self._compute_features = compute_features
 
         # -- graph state --
         self.graph = Graph()
@@ -116,6 +117,9 @@ class GraphBuilder:
         self._symbol_index: Dict[Tuple[str, str], str] = {} # (module_name, qualname) -> node_id
         self._class_ids: Set[str] = set()
         self._func_ids: Set[str] = set()
+
+        # AST node references for feature computation (node_id -> ast node)
+        self._ast_nodes: Dict[str, ast.AST] = {}
 
         # Per-module binding environments (populated during Pass 2 import extraction)
         # module_name -> {alias_name: ("module", module_name) | ("symbol", "pkg.mod.Name")}
@@ -163,6 +167,10 @@ class GraphBuilder:
         self._pass1_index_definitions()
         self._pass2_extract_relationships()
         self._prune_unresolved()
+
+        if self._compute_features:
+            from graph_builder.features import compute_all_features
+            compute_all_features(self.graph, self)
 
         if self._parse_errors:
             print(
@@ -381,6 +389,7 @@ class GraphBuilder:
                 cls_nid = self._class_id(module_name, qual)
                 self._add_node(cls_nid, NT_CLASS)
                 self._class_ids.add(cls_nid)
+                self._ast_nodes[cls_nid] = stmt
 
                 if parent_kind == "module":
                     self._add_edge(parent_nid, ET_DEFINES_CLASS, cls_nid)
@@ -410,6 +419,7 @@ class GraphBuilder:
                 func_nid = self._func_id(module_name, qual)
                 self._add_node(func_nid, NT_FUNCTION)
                 self._func_ids.add(func_nid)
+                self._ast_nodes[func_nid] = stmt
 
                 if parent_kind == "class":
                     self._add_edge(parent_nid, ET_DEFINES_METHOD, func_nid)
