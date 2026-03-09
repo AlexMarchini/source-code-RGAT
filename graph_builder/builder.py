@@ -162,6 +162,7 @@ class GraphBuilder:
         self._pass0_scan_files()
         self._pass1_index_definitions()
         self._pass2_extract_relationships()
+        self._prune_unresolved()
 
         if self._parse_errors:
             print(
@@ -171,6 +172,43 @@ class GraphBuilder:
             )
 
         return self.graph
+
+    # ------------------------------------------------------------------ #
+    # Post-processing                                                      #
+    # ------------------------------------------------------------------ #
+
+    def _prune_unresolved(self) -> None:
+        """Remove all CALLS_SYMBOL edges and the symbol nodes they pointed to.
+
+        Symbol nodes that are *only* reachable via CALLS_SYMBOL have no value
+        in the final graph.  This keeps the output clean for downstream
+        GNN/RGAT consumers.
+        """
+        # Collect symbol node-ids that appear as targets of CALLS_SYMBOL
+        sym_targets: Set[str] = {
+            e.target for e in self.graph.edges if e.type == ET_CALLS_SYMBOL
+        }
+
+        # Drop all CALLS_SYMBOL edges
+        self.graph.edges = [
+            e for e in self.graph.edges if e.type != ET_CALLS_SYMBOL
+        ]
+        self._edge_set = {
+            k for k in self._edge_set if k[1] != ET_CALLS_SYMBOL
+        }
+
+        # Find symbol nodes that are still referenced by any remaining edge
+        referenced: Set[str] = set()
+        for e in self.graph.edges:
+            referenced.add(e.source)
+            referenced.add(e.target)
+
+        # Remove orphaned symbol nodes
+        orphans = sym_targets - referenced
+        self.graph.nodes = [
+            n for n in self.graph.nodes if n.id not in orphans
+        ]
+        self._node_ids -= orphans
 
     # ------------------------------------------------------------------ #
     # Node / Edge helpers (dedup)                                          #
