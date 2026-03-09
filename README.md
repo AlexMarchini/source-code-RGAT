@@ -3,8 +3,17 @@
 ## graph_builder – Python Code Graph Builder
 
 Analyses any Python repository using the built-in `ast` module and constructs a
-**heterogeneous directed graph** suitable for R-GAT / GNN workloads.  
-**Standard-library only** — no external dependencies.
+**heterogeneous directed graph** suitable for R-GAT / GNN workloads.
+
+### Installation
+
+```bash
+pip install -r requirements.txt
+```
+
+This installs [igraph](https://igraph.org/) and
+[leidenalg](https://leidenalg.readthedocs.io/), used to compute graph-level
+node features (PageRank, HITS hub/authority scores, Leiden communities).
 
 ### Quick start
 
