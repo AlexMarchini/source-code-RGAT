@@ -18,10 +18,17 @@ node features (PageRank, HITS hub/authority scores, Leiden communities).
 ### Quick start
 
 ```bash
-# Run from the repository root
+# Single repository (legacy syntax)
 python -m graph_builder \
     --repo_root /path/to/target/repo \
     --repo_name my_project \
+    --out graph.json
+
+# Multi-repository (preferred for cross-project analysis)
+python -m graph_builder \
+    --repo django:/path/to/django \
+    --repo drf:/path/to/djangorestframework \
+    --repo wagtail:/path/to/wagtail \
     --out graph.json
 ```
 
@@ -31,9 +38,19 @@ python -m graph_builder \
 from pathlib import Path
 from graph_builder import GraphBuilder
 
+# Single repo (backward compatible)
 graph = GraphBuilder(
     repo_root=Path("/path/to/target/repo"),
     repo_name="my_project",
+).build()
+
+# Multi-repo — cross-repo imports, inheritance, and calls are resolved
+graph = GraphBuilder(
+    repos=[
+        (Path("/path/to/django"), "django"),
+        (Path("/path/to/drf"), "drf"),
+        (Path("/path/to/wagtail"), "wagtail"),
+    ],
 ).build()
 
 graph.write_json("graph.json")
@@ -69,7 +86,12 @@ print(graph.summary())
 
 ```json
 {
-  "metadata": { "repo_name": "...", "created_at": "ISO-8601", "repo_root": "..." },
+  "metadata": {
+    "repos": [{"name": "django", "root": "/..."}, {"name": "drf", "root": "/..."}],
+    "repo_name": "django",
+    "created_at": "ISO-8601",
+    "repo_root": "..."
+  },
   "nodes": [ { "id": "...", "type": "module" }, ... ],
   "edges": [ { "source": "...", "type": "IMPORTS_MODULE", "target": "..." }, ... ]
 }

@@ -224,10 +224,8 @@ def _get_function_source(node_id: str, ast_node: ast.AST, builder: "GraphBuilder
     module_name = id_parts[2] if len(id_parts) >= 3 else ""
     module_nid = builder._module_by_name.get(module_name)
     file_nid = builder._file_by_module.get(module_nid, "") if module_nid else ""
-    file_parts = file_nid.split("::", 2) if file_nid else []
-    relpath = file_parts[2] if len(file_parts) == 3 else ""
 
-    source = builder._source_cache.get(relpath, "")
+    source = builder._source_cache.get(file_nid, "")
     if not source or not hasattr(ast_node, "lineno"):
         return ""
 
@@ -270,9 +268,21 @@ def _compute_repo_features(
         NT_MODULE,
     )
 
-    type_counts = Counter(n.type for n in graph.nodes)
+    # Extract this repo's name from the node id: repo::<name>
+    repo_name = node.id.split("::", 1)[1] if "::" in node.id else builder.repo_name
+    repo_prefix = f"file::{repo_name}::"
+
+    # Count only nodes belonging to this repo
+    repo_nodes = [
+        n for n in graph.nodes if n.id.split("::", 2)[1] == repo_name
+    ] if len(builder.repos) > 1 else graph.nodes
+    type_counts = Counter(n.type for n in repo_nodes)
+
     total_loc = 0
-    for _relpath, source in builder._source_cache.items():
+    for cache_key, source in builder._source_cache.items():
+        # Cache keys are file node-ids: file::<repo>::<relpath>
+        if len(builder.repos) > 1 and not cache_key.startswith(repo_prefix):
+            continue
         total_loc += source.count("\n") + (1 if source and not source.endswith("\n") else 0)
 
     node.features.update({
@@ -282,7 +292,7 @@ def _compute_repo_features(
         "num_functions": type_counts.get(NT_FUNCTION, 0),
         "total_loc": total_loc,
         "num_packages": len(builder._packages),
-        "embedding_input": builder.repo_name,
+        "embedding_input": repo_name,
     })
 
 
@@ -295,14 +305,15 @@ def _compute_file_features(
     parts = node.id.split("::", 2)
     relpath = parts[2] if len(parts) == 3 else ""
 
-    source = builder._source_cache.get(relpath, "")
+    # Cache is keyed by file node-id (node.id itself)
+    source = builder._source_cache.get(node.id, "")
     loc = source.count("\n") + (1 if source and not source.endswith("\n") else 0)
     byte_size = len(source.encode("utf-8"))
     path_depth = len(Path(relpath).parts)
     is_init = Path(relpath).name == "__init__.py"
     is_test = "test" in relpath.lower()
 
-    tree = builder._ast_cache.get(relpath)
+    tree = builder._ast_cache.get(node.id)
     num_top_level_stmts = len(tree.body) if tree else 0
 
     # embedding_input: file path + space-separated top-level definition names
@@ -335,10 +346,8 @@ def _compute_module_features(
 
     # Find the source file for this module
     file_nid = builder._file_by_module.get(node.id, "")
-    file_parts = file_nid.split("::", 2) if file_nid else []
-    relpath = file_parts[2] if len(file_parts) == 3 else ""
 
-    tree = builder._ast_cache.get(relpath)
+    tree = builder._ast_cache.get(file_nid)
 
     num_imports = 0
     num_import_names = 0

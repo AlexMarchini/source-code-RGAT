@@ -1,9 +1,16 @@
 """
 graph_builder.cli – Command-line interface for the code graph builder.
 
-Usage::
+Usage (single repo)::
 
     python -m graph_builder --repo_root /path/to/repo --repo_name my_repo --out graph.json
+
+Usage (multi-repo)::
+
+    python -m graph_builder \\
+        --repo django:/path/to/django \\
+        --repo drf:/path/to/drf \\
+        --out graph.json
 """
 
 from __future__ import annotations
@@ -18,22 +25,39 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="graph_builder",
         description=(
-            "Analyse a Python repository and produce a heterogeneous directed "
-            "graph (JSON) suitable for R-GAT / GNN workloads."
+            "Analyse one or more Python repositories and produce a "
+            "heterogeneous directed graph (JSON) suitable for R-GAT / GNN "
+            "workloads."
         ),
     )
+
+    # ---- multi-repo interface (preferred) ----
+    parser.add_argument(
+        "--repo",
+        type=str,
+        action="append",
+        metavar="NAME:PATH",
+        default=None,
+        help=(
+            "Repository in NAME:PATH format.  Can be repeated for multi-repo "
+            "builds (e.g. --repo django:/src/django --repo drf:/src/drf)."
+        ),
+    )
+
+    # ---- legacy single-repo interface ----
     parser.add_argument(
         "--repo_root",
         type=Path,
-        required=True,
-        help="Path to the repository root directory.",
+        default=None,
+        help="(Legacy) Path to a single repository root directory.",
     )
     parser.add_argument(
         "--repo_name",
         type=str,
-        required=True,
-        help="Short human-readable name for the repository (used in node IDs).",
+        default=None,
+        help="(Legacy) Short human-readable name for the repository.",
     )
+
     parser.add_argument(
         "--out",
         type=Path,
@@ -48,16 +72,43 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
-    repo_root: Path = args.repo_root.resolve()
-    if not repo_root.is_dir():
-        print(f"Error: {repo_root} is not a directory.", file=sys.stderr)
-        sys.exit(1)
+    # ---- resolve repos list ----
+    repos = []
+
+    if args.repo:
+        for spec in args.repo:
+            if ":" not in spec:
+                print(
+                    f"Error: --repo must be NAME:PATH, got: {spec!r}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            name, path_str = spec.split(":", 1)
+            root = Path(path_str).resolve()
+            if not root.is_dir():
+                print(f"Error: {root} is not a directory.", file=sys.stderr)
+                sys.exit(1)
+            repos.append((root, name))
+
+    if not repos:
+        # Fall back to legacy single-repo arguments
+        if args.repo_root is None or args.repo_name is None:
+            print(
+                "Error: provide either --repo NAME:PATH (repeatable) "
+                "or both --repo_root and --repo_name.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        repo_root: Path = args.repo_root.resolve()
+        if not repo_root.is_dir():
+            print(f"Error: {repo_root} is not a directory.", file=sys.stderr)
+            sys.exit(1)
+        repos.append((repo_root, args.repo_name))
 
     # Import here so --help stays fast and doesn't trigger ast parsing
     from graph_builder.builder import GraphBuilder
 
-    builder = GraphBuilder(repo_root=repo_root, repo_name=args.repo_name,
-                           compute_features=not args.no_features)
+    builder = GraphBuilder(repos=repos, compute_features=not args.no_features)
     # Jedi is enabled automatically by GraphBuilder if installed.
     graph = builder.build()
     graph.write_json(args.out)
