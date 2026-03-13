@@ -84,19 +84,55 @@ def _dotted_name(node: ast.expr) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 class GraphBuilder:
-    """Build a heterogeneous directed graph from a Python repository.
+    """Build a heterogeneous directed graph from one or more Python repositories.
 
     Parameters
     ----------
-    repo_root : Path
-        Absolute (or relative) path to the repository root directory.
-    repo_name : str
+    repo_root : Path, optional
+        Absolute (or relative) path to a single repository root directory.
+        Mutually exclusive with *repos*; kept for backward compatibility.
+    repo_name : str, optional
         Short human-readable name used in node IDs (e.g. ``"my_project"``).
+        Required when *repo_root* is given.
+    repos : list of (Path, str) tuples, optional
+        Multiple repositories as ``[(root_path, name), ...]``.  When given,
+        a single unified graph is built across all roots so that cross-repo
+        edges (imports, inheritance, calls) are resolved automatically.
     """
 
-    def __init__(self, repo_root: Path, repo_name: str) -> None:
-        self.repo_root = Path(repo_root).resolve()
-        self.repo_name = repo_name
+    def __init__(
+        self,
+        repo_root: Optional[Path] = None,
+        repo_name: Optional[str] = None,
+        *,
+        repos: Optional[List[Tuple[Path, str]]] = None,
+        compute_features: bool = True,
+    ) -> None:
+        # ---- multi-repo / single-repo normalisation ----
+        if repos is not None:
+            self.repos: List[Tuple[Path, str]] = [
+                (Path(r).resolve(), n) for r, n in repos
+            ]
+        elif repo_root is not None and repo_name is not None:
+            self.repos = [(Path(repo_root).resolve(), repo_name)]
+        else:
+            raise ValueError(
+                "Provide either (repo_root, repo_name) or repos=[(root, name), ...]"
+            )
+
+        # Backward-compat shortcuts (always point to the first repo)
+        self.repo_root: Path = self.repos[0][0]
+        self.repo_name: str = self.repos[0][1]
+
+        # Multi-repo lookup tables
+        self._repo_roots: Dict[str, Path] = {n: r for r, n in self.repos}
+        self._repo_for_module: Dict[str, str] = {}   # module_name → repo_name
+
+        # Per-iteration context (set before processing each file / repo)
+        self._current_repo: str = self.repo_name
+        self._current_root: Path = self.repo_root
+
+        self._compute_features = compute_features
 
         # -- graph state --
         self.graph = Graph()
@@ -108,14 +144,17 @@ class GraphBuilder:
         self._module_by_name: Dict[str, str] = {}          # module_name -> node_id
         self._module_by_file: Dict[str, str] = {}           # file_id   -> module_id
         self._file_by_module: Dict[str, str] = {}           # module_id -> file_id
-        self._file_paths: List[Tuple[str, Path]] = []       # (relpath_str, abs_path) sorted
+        self._file_paths: List[Tuple[str, Path, str]] = []  # (relpath, abs_path, repo_name)
 
-        # Pass 1
-        self._ast_cache: Dict[str, ast.Module] = {}         # relpath_str -> parsed AST
-        self._source_cache: Dict[str, str] = {}             # relpath_str -> source text
+        # Pass 1 — caches keyed by file node-id (globally unique)
+        self._ast_cache: Dict[str, ast.Module] = {}         # file_nid -> parsed AST
+        self._source_cache: Dict[str, str] = {}             # file_nid -> source text
         self._symbol_index: Dict[Tuple[str, str], str] = {} # (module_name, qualname) -> node_id
         self._class_ids: Set[str] = set()
         self._func_ids: Set[str] = set()
+
+        # AST node references for feature computation (node_id -> ast node)
+        self._ast_nodes: Dict[str, ast.AST] = {}
 
         # Per-module binding environments (populated during Pass 2 import extraction)
         # module_name -> {alias_name: ("module", module_name) | ("symbol", "pkg.mod.Name")}
@@ -135,7 +174,8 @@ class GraphBuilder:
 
         # Jedi integration — enabled automatically if jedi is installed.
         self._use_jedi: bool = False
-        self._jedi_project: Any = None
+        self._jedi_projects: Dict[str, Any] = {}   # repo_name → jedi.Project
+        self._jedi_project: Any = None              # backward-compat (first repo)
         try:
             self.enable_jedi()
         except ImportError:
@@ -154,8 +194,13 @@ class GraphBuilder:
     def build(self) -> Graph:
         """Execute all passes and return the finished :class:`Graph`."""
         self.graph.metadata = {
-            "repo_name": self.repo_name,
+            "repos": [
+                {"name": name, "root": str(root)}
+                for root, name in self.repos
+            ],
             "created_at": datetime.now(timezone.utc).isoformat(),
+            # Backward-compat keys (first repo)
+            "repo_name": self.repo_name,
             "repo_root": str(self.repo_root),
         }
 
@@ -163,6 +208,10 @@ class GraphBuilder:
         self._pass1_index_definitions()
         self._pass2_extract_relationships()
         self._prune_unresolved()
+
+        if self._compute_features:
+            from graph_builder.features import compute_all_features
+            compute_all_features(self.graph, self)
 
         if self._parse_errors:
             print(
@@ -234,22 +283,22 @@ class GraphBuilder:
     # ------------------------------------------------------------------ #
 
     def _repo_id(self) -> str:
-        return f"repo::{self.repo_name}"
+        return f"repo::{self._current_repo}"
 
     def _file_id(self, relpath: str) -> str:
-        return f"file::{self.repo_name}::{relpath}"
+        return f"file::{self._current_repo}::{relpath}"
 
     def _module_id(self, module_name: str) -> str:
-        return f"mod::{self.repo_name}::{module_name}"
+        return f"mod::{self._current_repo}::{module_name}"
 
     def _class_id(self, module_name: str, qualname: str) -> str:
-        return f"class::{self.repo_name}::{module_name}::{qualname}"
+        return f"class::{self._current_repo}::{module_name}::{qualname}"
 
     def _func_id(self, module_name: str, qualname: str) -> str:
-        return f"func::{self.repo_name}::{module_name}::{qualname}"
+        return f"func::{self._current_repo}::{module_name}::{qualname}"
 
     def _symbol_id(self, scope: str, text: str) -> str:
-        return f"sym::{self.repo_name}::{scope}::{text}"
+        return f"sym::{self._current_repo}::{scope}::{text}"
 
     # ------------------------------------------------------------------ #
     # Module-name derivation                                               #
@@ -276,20 +325,27 @@ class GraphBuilder:
     # ------------------------------------------------------------------ #
 
     def _pass0_scan_files(self) -> None:
-        """Walk the repository for *.py files, create repo/file/module nodes
+        """Walk every repository for *.py files, create repo/file/module nodes
         and the initial containment edges."""
+
+        for repo_root, repo_name in self.repos:
+            self._current_repo = repo_name
+            self._current_root = repo_root
+            self._scan_one_repo(repo_root, repo_name)
+
+    def _scan_one_repo(self, repo_root: Path, repo_name: str) -> None:
+        """Scan a single repository root and populate nodes/edges/maps."""
 
         repo_id = self._repo_id()
         self._add_node(repo_id, NT_REPO)
 
         # First pass: discover packages (dirs with __init__.py)
-        self._packages = set()
-        for init_path in sorted(self.repo_root.rglob("__init__.py")):
-            if self._should_skip(init_path):
+        for init_path in sorted(repo_root.rglob("__init__.py")):
+            if self._should_skip(init_path, repo_root):
                 continue
             # Record every ancestor package between repo_root and the init dir
             pkg_dir = init_path.parent
-            rel = pkg_dir.relative_to(self.repo_root)
+            rel = pkg_dir.relative_to(repo_root)
             # Add this dir and every parent dir up to (but not including) repo_root
             parts = rel.parts
             for i in range(len(parts)):
@@ -300,10 +356,10 @@ class GraphBuilder:
 
         # Collect all .py files, sorted for determinism
         py_files: List[Tuple[str, Path]] = []
-        for abs_path in sorted(self.repo_root.rglob("*.py")):
-            if self._should_skip(abs_path):
+        for abs_path in sorted(repo_root.rglob("*.py")):
+            if self._should_skip(abs_path, repo_root):
                 continue
-            relpath_str = str(abs_path.relative_to(self.repo_root))
+            relpath_str = str(abs_path.relative_to(repo_root))
             py_files.append((relpath_str, abs_path))
 
         for relpath_str, abs_path in py_files:
@@ -323,12 +379,14 @@ class GraphBuilder:
             self._module_by_name[module_name] = module_nid
             self._module_by_file[file_nid] = module_nid
             self._file_by_module[module_nid] = file_nid
+            self._repo_for_module[module_name] = repo_name
 
-            self._file_paths.append((relpath_str, abs_path))
+            self._file_paths.append((relpath_str, abs_path, repo_name))
 
-    def _should_skip(self, path: Path) -> bool:
+    def _should_skip(self, path: Path, repo_root: Optional[Path] = None) -> bool:
         """Return True if *path* should be excluded from the scan."""
-        for part in path.relative_to(self.repo_root).parts:
+        root = repo_root if repo_root is not None else self._current_root
+        for part in path.relative_to(root).parts:
             if any(part.startswith(pfx) for pfx in _SKIP_DIR_PREFIXES):
                 return True
         return False
@@ -341,7 +399,9 @@ class GraphBuilder:
         """Parse every .py file and create class / function nodes with their
         definition edges."""
 
-        for relpath_str, abs_path in self._file_paths:
+        for relpath_str, abs_path, repo_name in self._file_paths:
+            self._current_repo = repo_name
+            self._current_root = self._repo_roots[repo_name]
             module_name = self._module_name_from_path(relpath_str)
             tree = self._parse_file(relpath_str, abs_path)
             if tree is None:
@@ -381,6 +441,7 @@ class GraphBuilder:
                 cls_nid = self._class_id(module_name, qual)
                 self._add_node(cls_nid, NT_CLASS)
                 self._class_ids.add(cls_nid)
+                self._ast_nodes[cls_nid] = stmt
 
                 if parent_kind == "module":
                     self._add_edge(parent_nid, ET_DEFINES_CLASS, cls_nid)
@@ -410,6 +471,7 @@ class GraphBuilder:
                 func_nid = self._func_id(module_name, qual)
                 self._add_node(func_nid, NT_FUNCTION)
                 self._func_ids.add(func_nid)
+                self._ast_nodes[func_nid] = stmt
 
                 if parent_kind == "class":
                     self._add_edge(parent_nid, ET_DEFINES_METHOD, func_nid)
@@ -435,9 +497,13 @@ class GraphBuilder:
 
         Returns *None* if the file cannot be read or parsed (error is logged
         to stderr and the counter is bumped).
+
+        The cache is keyed by the file's node-id (``file::<repo>::<relpath>``)
+        so that identically-named files in different repos don't collide.
         """
-        if relpath in self._ast_cache:
-            return self._ast_cache[relpath]
+        cache_key = self._file_id(relpath)
+        if cache_key in self._ast_cache:
+            return self._ast_cache[cache_key]
         try:
             source = abs_path.read_text(encoding="utf-8", errors="replace")
             tree = ast.parse(source, filename=relpath)
@@ -449,8 +515,8 @@ class GraphBuilder:
             print(f"[graph_builder] Error reading {relpath}: {exc}", file=sys.stderr)
             self._parse_errors += 1
             return None
-        self._ast_cache[relpath] = tree
-        self._source_cache[relpath] = source
+        self._ast_cache[cache_key] = tree
+        self._source_cache[cache_key] = source
         return tree
 
     # ------------------------------------------------------------------ #
@@ -471,18 +537,24 @@ class GraphBuilder:
            binding environment, and parent-class tables.
         """
         # Sub-pass 1: imports
-        for relpath_str, _abs_path in self._file_paths:
-            if relpath_str not in self._ast_cache:
+        for relpath_str, _abs_path, repo_name in self._file_paths:
+            self._current_repo = repo_name
+            self._current_root = self._repo_roots[repo_name]
+            file_nid = self._file_id(relpath_str)
+            if file_nid not in self._ast_cache:
                 continue
-            tree = self._ast_cache[relpath_str]
+            tree = self._ast_cache[file_nid]
             module_name = self._module_name_from_path(relpath_str)
             self._extract_imports(tree, module_name)
 
         # Sub-pass 2: inheritance (all files before calls)
-        for relpath_str, _abs_path in self._file_paths:
-            if relpath_str not in self._ast_cache:
+        for relpath_str, _abs_path, repo_name in self._file_paths:
+            self._current_repo = repo_name
+            self._current_root = self._repo_roots[repo_name]
+            file_nid = self._file_id(relpath_str)
+            if file_nid not in self._ast_cache:
                 continue
-            tree = self._ast_cache[relpath_str]
+            tree = self._ast_cache[file_nid]
             module_name = self._module_name_from_path(relpath_str)
             self._extract_inheritance(tree, module_name)
 
@@ -490,10 +562,13 @@ class GraphBuilder:
         self._build_class_parents()
 
         # Sub-pass 4: call extraction
-        for relpath_str, abs_path in self._file_paths:
-            if relpath_str not in self._ast_cache:
+        for relpath_str, abs_path, repo_name in self._file_paths:
+            self._current_repo = repo_name
+            self._current_root = self._repo_roots[repo_name]
+            file_nid = self._file_id(relpath_str)
+            if file_nid not in self._ast_cache:
                 continue
-            tree = self._ast_cache[relpath_str]
+            tree = self._ast_cache[file_nid]
             module_name = self._module_name_from_path(relpath_str)
             self._extract_calls(tree, module_name, relpath_str, abs_path)
 
@@ -724,17 +799,20 @@ class GraphBuilder:
         """Walk function bodies and emit CALLS / CALLS_SYMBOL edges."""
         # Build a per-file jedi.Script when jedi integration is enabled.
         jedi_script: Any = None
-        if self._use_jedi and self._jedi_project is not None:
-            try:
-                import jedi  # type: ignore
-                source = self._source_cache.get(relpath_str, "")
-                jedi_script = jedi.Script(
-                    code=source,
-                    path=str(abs_path),
-                    project=self._jedi_project,
-                )
-            except Exception:
-                pass
+        if self._use_jedi:
+            jedi_project = self._jedi_projects.get(self._current_repo)
+            if jedi_project is not None:
+                try:
+                    import jedi  # type: ignore
+                    file_nid = self._file_id(relpath_str)
+                    source = self._source_cache.get(file_nid, "")
+                    jedi_script = jedi.Script(
+                        code=source,
+                        path=str(abs_path),
+                        project=jedi_project,
+                    )
+                except Exception:
+                    pass
         self._walk_for_calls(
             tree.body, module_name, enclosing_func=None,
             class_chain=[], jedi_script=jedi_script,
@@ -1040,11 +1118,17 @@ class GraphBuilder:
                 continue
             import os as _os
             mod_path_str = str(mod_path)
-            repo_root_str = str(self.repo_root)
-            if not mod_path_str.startswith(repo_root_str):
+            # Check against all repo roots (multi-repo aware)
+            matched_root_str: Optional[str] = None
+            for _rname, rroot in self._repo_roots.items():
+                rroot_str = str(rroot)
+                if mod_path_str.startswith(rroot_str):
+                    matched_root_str = rroot_str
+                    break
+            if matched_root_str is None:
                 continue  # External library — no node in our graph
             # Map file path to module name
-            rel = mod_path_str[len(repo_root_str):].lstrip(_os.sep).replace(_os.sep, "/")
+            rel = mod_path_str[len(matched_root_str):].lstrip(_os.sep).replace(_os.sep, "/")
             target_module = self._module_name_from_path(rel)
             if not target_module:
                 continue
@@ -1085,7 +1169,11 @@ class GraphBuilder:
             ) from exc
         import jedi as _jedi  # type: ignore
         self._use_jedi = True
-        self._jedi_project = _jedi.Project(path=str(self.repo_root))
+        self._jedi_projects = {}
+        for repo_root, repo_name in self.repos:
+            self._jedi_projects[repo_name] = _jedi.Project(path=str(repo_root))
+        # Backward-compat shortcut
+        self._jedi_project = self._jedi_projects.get(self.repo_name)
 
     def _classify_unresolved(
         self,

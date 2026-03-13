@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Union
 
 
 # ---------------------------------------------------------------------------
@@ -22,15 +22,22 @@ class Node:
     """A single graph node.
 
     Attributes:
-        id:   Deterministic, globally-unique identifier (see ID schema).
-        type: One of repo | file | module | class | function | symbol.
+        id:       Deterministic, globally-unique identifier (see ID schema).
+        type:     One of repo | file | module | class | function | symbol.
+        features: Optional numeric / boolean feature dict for GNN training.
     """
 
     id: str
     type: str
+    features: Dict[str, Union[int, float, bool, str]] = field(
+        default_factory=dict, compare=False, repr=False,
+    )
 
-    def to_dict(self) -> Dict[str, str]:
-        return {"id": self.id, "type": self.type}
+    def to_dict(self) -> Dict[str, Any]:
+        d: Dict[str, Any] = {"id": self.id, "type": self.type}
+        if self.features:
+            d["features"] = self.features
+        return d
 
 
 # ---------------------------------------------------------------------------
