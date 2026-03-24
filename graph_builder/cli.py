@@ -70,6 +70,48 @@ def main(argv: list[str] | None = None) -> None:
         default=False,
         help="Skip node feature computation (topology-only output).",
     )
+
+    # ---- git enrichment options ----
+    parser.add_argument(
+        "--enrich-git",
+        action="store_true",
+        default=False,
+        help="Enrich the graph with git history data (commits, blame, co-change).",
+    )
+    parser.add_argument(
+        "--git-depth",
+        type=int,
+        default=500,
+        metavar="N",
+        help="Max commits per repo for git enrichment (default: 500).",
+    )
+    parser.add_argument(
+        "--git-since",
+        type=str,
+        default=None,
+        metavar="DATE",
+        help='Only consider commits after DATE (e.g. "2024-01-01").',
+    )
+    parser.add_argument(
+        "--co-change-min",
+        type=int,
+        default=3,
+        metavar="N",
+        help="Min co-occurrence count for CO_CHANGES_WITH edges (default: 3).",
+    )
+    parser.add_argument(
+        "--no-git-blame",
+        action="store_true",
+        default=False,
+        help="Skip git blame computation during enrichment.",
+    )
+    parser.add_argument(
+        "--git-workers",
+        type=int,
+        default=8,
+        metavar="N",
+        help="Thread pool size for parallel git operations (default: 8).",
+    )
     args = parser.parse_args(argv)
 
     # ---- resolve repos list ----
@@ -111,6 +153,23 @@ def main(argv: list[str] | None = None) -> None:
     builder = GraphBuilder(repos=repos, compute_features=not args.no_features)
     # Jedi is enabled automatically by GraphBuilder if installed.
     graph = builder.build()
+
+    # ---- optional git enrichment ----
+    if args.enrich_git:
+        from graph_builder.git_enricher import enrich_git
+
+        repo_map = {name: root for root, name in repos}
+        graph = enrich_git(
+            graph,
+            repo_map,
+            builder=builder,
+            depth=args.git_depth,
+            since=args.git_since,
+            co_change_min=args.co_change_min,
+            blame_functions=not args.no_git_blame,
+            workers=args.git_workers,
+        )
+
     graph.write_json(args.out)
 
     # Print summary to stdout

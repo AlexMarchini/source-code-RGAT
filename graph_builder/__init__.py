@@ -15,5 +15,6 @@ Usage (CLI):
 
 from graph_builder.model import Node, Edge, Graph          # noqa: F401
 from graph_builder.builder import GraphBuilder              # noqa: F401
+from graph_builder.git_enricher import enrich_git            # noqa: F401
 
-__all__ = ["Node", "Edge", "Graph", "GraphBuilder"]
+__all__ = ["Node", "Edge", "Graph", "GraphBuilder", "enrich_git"]

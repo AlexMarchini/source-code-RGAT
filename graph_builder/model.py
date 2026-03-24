@@ -49,17 +49,24 @@ class Edge:
     """A directed edge (relation) in the graph.
 
     Attributes:
-        source: Node id of the tail.
-        type:   Relation label (e.g. CALLS, INHERITS).
-        target: Node id of the head.
+        source:   Node id of the tail.
+        type:     Relation label (e.g. CALLS, INHERITS).
+        target:   Node id of the head.
+        features: Optional numeric / boolean feature dict (e.g. edge weights).
     """
 
     source: str
     type: str
     target: str
+    features: Dict[str, Union[int, float, bool, str]] = field(
+        default_factory=dict, compare=False, repr=False,
+    )
 
-    def to_dict(self) -> Dict[str, str]:
-        return {"source": self.source, "type": self.type, "target": self.target}
+    def to_dict(self) -> Dict[str, Any]:
+        d: Dict[str, Any] = {"source": self.source, "type": self.type, "target": self.target}
+        if self.features:
+            d["features"] = self.features
+        return d
 
 
 # ---------------------------------------------------------------------------

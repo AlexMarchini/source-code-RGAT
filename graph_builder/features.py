@@ -465,6 +465,12 @@ def _compute_class_features(
     # Inheritance depth via BFS on _class_parents
     inheritance_depth = _compute_inheritance_depth(node.id, builder)
 
+    # Raw line range for downstream enrichment (git blame, etc.)
+    start_line = getattr(ast_node, "lineno", 0) if ast_node else 0
+    end_line = (
+        getattr(ast_node, "end_lineno", 0) or 0
+    ) if ast_node else 0
+
     node.features.update({
         "num_methods": num_methods,
         "num_bases": num_bases,
@@ -477,6 +483,8 @@ def _compute_class_features(
         "is_nested": is_nested,
         "num_dunder_methods": num_dunder_methods,
         "line_span": line_span,
+        "start_line": start_line,
+        "end_line": end_line,
         "in_degree": in_degree.get(node.id, 0),
         "out_degree": out_degree.get(node.id, 0),
         "embedding_input": _class_embedding_input(qualname, ast_node),
@@ -575,6 +583,8 @@ def _compute_function_features(
                 if hasattr(ast_node, "end_lineno") and ast_node.end_lineno
                 else 0
             ),
+            "start_line": ast_node.lineno,
+            "end_line": getattr(ast_node, "end_lineno", 0) or 0,
             "body_stmt_count": _body_stmt_count(ast_node.body),
             "has_docstring": _has_docstring(ast_node),
             "docstring_length": _docstring_length(ast_node),
