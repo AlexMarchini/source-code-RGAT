@@ -125,84 +125,6 @@ def evaluate_link_prediction(
     return per_relation, total_loss
 
 
-# ── Attention diversity helper ─────────────────────────────────────────
-# (parameter-level: no extra forward pass needed)
-
-def _compute_diversity_loss(
-    encoder: HeteroRGATEncoder,
-    diversity_criterion: "AttentionDiversityLoss",
-    train_data: "HeteroData",
-) -> Tensor:
-    """Capture attention outputs and compute the enhanced diversity loss.
-
-    Runs a short hook-based forward pass on a sample of edge types to
-    populate ``diversity_criterion.cached_attn``, then delegates to the
-    criterion which uses output-based entropy + orthogonality + Gini terms.
-    """
-    import torch.nn.functional as _F
-
-    # Collect attention weights from the first layer's local convolutions
-    # by calling each sub-conv with return_attention_weights=True.
-    cached: Dict[str, Tensor] = {}
-
-    with torch.no_grad():
-        # Re-use the already-projected features from the encoder cache
-        # to avoid a full second forward pass.  We only need the first
-        # conv layer's attention.
-        x_dict_proj: Dict[str, Tensor] = {}
-        for ntype in encoder.node_types:
-            x_scalar = train_data[ntype].x_scalar
-            x_text = train_data[ntype].x_text
-            leiden_ids = train_data[ntype].leiden_ids
-            x_leiden = encoder.leiden_embedding(leiden_ids)
-            x_cat = torch.cat([x_scalar, x_text, x_leiden], dim=-1)
-            x_dict_proj[ntype] = _F.elu(encoder.input_proj[ntype](x_cat))
-
-        edge_index_dict = {
-            et: train_data[et].edge_index
-            for et in encoder.edge_types
-            if hasattr(train_data[et], "edge_index")
-        }
-
-        ms_conv = encoder.convs[0]  # first layer
-
-        # Local branch attention
-        for edge_type, sub_conv in ms_conv.local_conv.convs.items():
-            src_type, rel, dst_type = edge_type
-            if edge_type not in edge_index_dict:
-                continue
-            ei = edge_index_dict[edge_type]
-            result = sub_conv(
-                (x_dict_proj[src_type], x_dict_proj[dst_type]), ei,
-                return_attention_weights=True,
-            )
-            if isinstance(result, tuple) and len(result) == 2:
-                _, attn_info = result
-                if isinstance(attn_info, tuple) and len(attn_info) == 2:
-                    _, alpha = attn_info
-                    cached[f"local_{src_type}_{rel}_{dst_type}"] = alpha
-
-        # Global branch attention
-        global_ei = getattr(encoder, "_global_ei_cache", edge_index_dict)
-        for edge_type, sub_conv in ms_conv.global_conv.convs.items():
-            src_type, rel, dst_type = edge_type
-            ei = global_ei.get(edge_type, edge_index_dict.get(edge_type))
-            if ei is None:
-                continue
-            result = sub_conv(
-                (x_dict_proj[src_type], x_dict_proj[dst_type]), ei,
-                return_attention_weights=True,
-            )
-            if isinstance(result, tuple) and len(result) == 2:
-                _, attn_info = result
-                if isinstance(attn_info, tuple) and len(attn_info) == 2:
-                    _, alpha = attn_info
-                    cached[f"global_{src_type}_{rel}_{dst_type}"] = alpha
-
-    diversity_criterion.cached_attn = cached
-    return diversity_criterion(encoder)
-
-
 # ── Training loop ──────────────────────────────────────────────────────
 
 def train(
@@ -276,8 +198,13 @@ def train(
         predictor.train()
         optimizer.zero_grad()
 
-        # Forward
-        z_dict = encoder(train_data)
+        # Forward — request attention weights when diversity loss is active
+        need_attn = use_diversity and epoch > config.diversity_warmup_epochs
+        if need_attn:
+            z_dict, attn_dict = encoder(train_data, return_attention_weights=True)
+        else:
+            z_dict = encoder(train_data)
+            attn_dict = None
 
         # Compute loss across all supervised triplets
         total_loss = torch.tensor(0.0, device=device, requires_grad=True)
@@ -297,9 +224,10 @@ def train(
             loss = criterion(logits, edge_label)
             total_loss = total_loss + loss
 
-        # ── Attention diversity regularisation (after warmup) ────────
-        if use_diversity and epoch > config.diversity_warmup_epochs:
-            div_loss = _compute_diversity_loss(encoder, diversity_criterion, train_data)
+        # ── Attention diversity regularisation (gradient-connected) ──
+        if need_attn and attn_dict:
+            diversity_criterion.cached_attn = attn_dict
+            div_loss = diversity_criterion(encoder)
             total_loss = total_loss + config.diversity_loss_weight * div_loss
 
         total_loss.backward()

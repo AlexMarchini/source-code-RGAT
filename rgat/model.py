@@ -1,31 +1,25 @@
 """
-rgat.model – Heterogeneous RGAT encoder and link-prediction decoder.
+rgat.model -- Heterogeneous RGAT encoder and link-prediction decoder.
 
 Architecture
 ------------
-1. **Input projection**: per-type ``nn.Linear`` that maps the concatenation
-   of (scalar features ∥ sentence embedding ∥ leiden embedding) to a uniform
-   ``hidden_dim``.
-2. **Multi-scale GATv2 message passing**: stacked ``MultiScaleHeteroConv``
-   layers that split attention heads across two context scales:
-
-   * **Local** (``num_heads // 2`` heads): attends to direct 1-hop
-     neighbours, capturing fine-grained structural cues.
-   * **Global** (``num_heads - num_heads // 2`` heads): applies a second
-     1-hop conv *on top of the local output*, giving each node an effective
-     2-hop receptive field for broader context.
-
-   Both branches produce ``hidden_dim``-sized tensors, concatenated and
-   re-projected by a learned linear per node type.  This partitioning forces
-   local and global heads to specialise rather than converging to the same
-   attention distribution.
-
-3. **Link predictor**: dot-product decoder over source / target node
-   embeddings → logits for ``BCEWithLogitsLoss``.
+1. Per-type input projection: (scalar || sentence || leiden) -> hidden_dim
+2. Stacked MultiScaleHeteroConv layers using GATConv (v1) with:
+   - Local branch (num_heads//2): 1-hop attention on direct neighbours
+   - Global branch (remaining heads): structural-role augmented edges
+   - Self-loops on same-type edges only
+   - Per-head diverse initialisation of att_src / att_dst
+   - Per-type scale_combine: [local || global] -> hidden_dim
+3. LayerNorm + residual + ELU + dropout between layers
+4. L2-normalised output embeddings
+5. Dot-product LinkPredictor
 """
 
 from __future__ import annotations
 
+import math
+import random
+from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple
 
 import torch
@@ -34,47 +28,50 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from torch_geometric.data import HeteroData
-from torch_geometric.nn import GATv2Conv, HeteroConv
+from torch_geometric.nn import GATConv
 
 
-# ────────────────────────────────────────────────────────────────────────
-# Helpers
-# ────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------ #
+# Helpers                                                              #
+# ------------------------------------------------------------------ #
 
-def _diversify_gatv2_heads(conv: "GATv2Conv") -> None:  # noqa: F821
-    """Break head-parameter symmetry with per-head diverse initialisation.
+def _diversify_gat_heads(conv: GATConv) -> None:
+    """Break head-parameter symmetry for GATConv with separate att_src/att_dst.
 
-    Default PyTorch init is symmetric across heads.  Two heads that start at
-    the same value stay at the same value throughout training (gradient
-    symmetry).  This function cycles through three distinct initialisation
-    strategies per head (mirroring the PoC) to ensure strong asymmetry from
-    the start.
+    Cycles through three init strategies per head to ensure strong asymmetry
+    from the start.
     """
-    H = conv.att.shape[1]       # number of heads
-    C = conv.att.shape[2]       # out_channels per head
+    if not hasattr(conv, "att_src") or not hasattr(conv, "att_dst"):
+        return
+    H = conv.att_src.shape[1]       # number of heads
+    C = conv.att_src.shape[2]       # out_channels per head
     with torch.no_grad():
         for h in range(H):
             if h % 3 == 0:
-                # Strategy 1: Xavier + noisy perturbation
-                nn.init.xavier_uniform_(conv.att.data[0, h:h + 1])
-                conv.att.data[0, h] += torch.randn_like(conv.att.data[0, h]) * 0.1
-                for lin in (conv.lin_l, conv.lin_r):
-                    nn.init.xavier_uniform_(lin.weight.data[h * C:(h + 1) * C])
-                    lin.weight.data[h * C:(h + 1) * C] += (
-                        torch.randn_like(lin.weight.data[h * C:(h + 1) * C]) * 0.1
-                    )
+                nn.init.xavier_uniform_(conv.att_src.data[:, h:h + 1])
+                nn.init.xavier_uniform_(conv.att_dst.data[:, h:h + 1])
+                conv.att_src.data[:, h] += torch.randn_like(conv.att_src.data[:, h]) * 0.1
+                conv.att_dst.data[:, h] += torch.randn_like(conv.att_dst.data[:, h]) * 0.1
+                for lin in (conv.lin_src, conv.lin_dst):
+                    if lin is not None and hasattr(lin, "weight"):
+                        nn.init.xavier_uniform_(lin.weight.data[h * C:(h + 1) * C])
+                        lin.weight.data[h * C:(h + 1) * C] += (
+                            torch.randn_like(lin.weight.data[h * C:(h + 1) * C]) * 0.1
+                        )
             elif h % 3 == 1:
-                # Strategy 2: Uniform with head-scaled range
                 scale = 0.2 + h * 0.1
-                nn.init.uniform_(conv.att.data[0, h:h + 1], -scale, scale)
-                for lin in (conv.lin_l, conv.lin_r):
-                    nn.init.uniform_(lin.weight.data[h * C:(h + 1) * C], -scale, scale)
+                nn.init.uniform_(conv.att_src.data[:, h:h + 1], -scale, scale)
+                nn.init.uniform_(conv.att_dst.data[:, h:h + 1], -scale, scale)
+                for lin in (conv.lin_src, conv.lin_dst):
+                    if lin is not None and hasattr(lin, "weight"):
+                        nn.init.uniform_(lin.weight.data[h * C:(h + 1) * C], -scale, scale)
             else:
-                # Strategy 3: Normal with head-specific std
                 std = 0.2 + h * 0.05
-                nn.init.normal_(conv.att.data[0, h:h + 1], mean=0, std=std)
-                for lin in (conv.lin_l, conv.lin_r):
-                    nn.init.normal_(lin.weight.data[h * C:(h + 1) * C], mean=0, std=std)
+                nn.init.normal_(conv.att_src.data[:, h:h + 1], mean=0, std=std)
+                nn.init.normal_(conv.att_dst.data[:, h:h + 1], mean=0, std=std)
+                for lin in (conv.lin_src, conv.lin_dst):
+                    if lin is not None and hasattr(lin, "weight"):
+                        nn.init.normal_(lin.weight.data[h * C:(h + 1) * C], mean=0, std=std)
 
 
 def _structural_global_edges(
@@ -85,38 +82,16 @@ def _structural_global_edges(
     walk_len: int = 3,
     rng_seed: int = 0,
 ) -> Tensor:
-    """Augment a homogeneous edge index with *structural-role* edges.
+    """Augment a homogeneous edge index with structural-role edges.
 
-    2-hop paths through hub nodes (e.g. ``__init__``, ``append``) produce
-    neighbourhoods dominated by the same few nodes for every source — the
-    softmax collapses to uniform and attention becomes uninformative.
-
-    This function instead adds edges that connect nodes sharing a *similar
-    structural role*, mirroring the PoC's ``_create_extended_edges``:
-
-    **Degree-bucket edges** — nodes are bucketed by their log₂(degree).
-    Nodes in the same bucket play a similar role (both leaves, both hubs,
-    etc.).  A bounded sample of within-bucket pairs is added.
-
-    **Random-walk co-occurrence edges** — short random walks from each node
-    collect a set of "reachable contexts".  Two nodes that frequently appear
-    in the same walk are likely to be structurally equivalent.  The start
-    node is connected to non-adjacent nodes encountered during the walk.
-
-    Both edge sets are capped at ``max_per_node`` new neighbours per node to
-    prevent the global graph from becoming too dense.
-
-    For heterogeneous edge types (``n_src ≠ n_dst``) the original index is
+    For heterogeneous edge types (n_src != n_dst) the original index is
     returned unchanged.
     """
     if n_src != n_dst or edge_index.size(1) == 0:
-        return edge_index   # structural roles only defined for same-type edges
+        return edge_index
 
-    import random
     rng = random.Random(rng_seed)
-
     N = n_src
-    # Build adjacency list (out-edges) and in-degree
     adj: Dict[int, List[int]] = {i: [] for i in range(N)}
     existing: Set[Tuple[int, int]] = set()
     in_deg = [0] * N
@@ -129,18 +104,13 @@ def _structural_global_edges(
         in_deg[b] += 1
 
     out_deg = [len(adj[i]) for i in range(N)]
-    added: Dict[int, int] = {i: 0 for i in range(N)}  # budget tracker per node
+    added: Dict[int, int] = {i: 0 for i in range(N)}
 
     new_src: List[int] = []
     new_dst: List[int] = []
 
     def _add(a: int, c: int) -> bool:
-        """Add edge a→c if new and both nodes have budget remaining."""
-        if (
-            c != a
-            and (a, c) not in existing
-            and added[a] < max_per_node
-        ):
+        if c != a and (a, c) not in existing and added[a] < max_per_node:
             new_src.append(a)
             new_dst.append(c)
             existing.add((a, c))
@@ -148,9 +118,7 @@ def _structural_global_edges(
             return True
         return False
 
-    # ── 1) Degree-bucket edges ─────────────────────────────────────────
-    # Group nodes by log2(out_degree+1) bucket (coarse structural role)
-    import math
+    # Degree-bucket edges
     buckets: Dict[int, List[int]] = {}
     for node in range(N):
         b = int(math.log2(out_deg[node] + 1))
@@ -159,21 +127,17 @@ def _structural_global_edges(
     for bucket_nodes in buckets.values():
         if len(bucket_nodes) < 2:
             continue
-        # Shuffle and sample pairs — bounded by max_per_node budget
         shuffled = bucket_nodes[:]
         rng.shuffle(shuffled)
-        # Pair consecutive nodes in the shuffled list
         for i in range(0, len(shuffled) - 1, 2):
             a, c = shuffled[i], shuffled[i + 1]
             _add(a, c)
-            _add(c, a)  # bidirectional structural similarity
+            _add(c, a)
 
-    # ── 2) Random-walk co-occurrence edges ────────────────────────────
-    # For each node, run a short walk and connect start to visited nodes
-    # that it doesn't already reach (skipping direct neighbours)
+    # Random-walk co-occurrence edges
     for start in range(N):
         if not adj[start]:
-            continue   # isolated node
+            continue
         cur = start
         visited: List[int] = []
         for _ in range(walk_len):
@@ -182,7 +146,6 @@ def _structural_global_edges(
             cur = rng.choice(adj[cur])
             if cur != start:
                 visited.append(cur)
-        # Connect start to non-adjacent visited nodes only
         for v in visited:
             if (start, v) not in existing:
                 _add(start, v)
@@ -196,48 +159,16 @@ def _structural_global_edges(
     return torch.cat([edge_index, extra], dim=1)
 
 
-# ────────────────────────────────────────────────────────────────────────
-# Multi-scale heterogeneous convolution block
-# ────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------ #
+# Multi-scale heterogeneous convolution block                          #
+# ------------------------------------------------------------------ #
 
 class MultiScaleHeteroConv(nn.Module):
-    """Drop-in replacement for ``HeteroConv`` with two-scale attention.
+    """Two-scale GATConv (v1) with separate att_src / att_dst per head.
 
-    Splits ``num_heads`` attention heads across a *local* and a *global*
-    branch that both start from the **same input features** ``x_dict`` but
-    see different neighbourhoods:
-
-    * **Local branch** (``num_heads // 2`` heads):
-      Standard 1-hop ``GATv2Conv`` over direct neighbours.
-
-    * **Global branch** (``num_heads - num_heads // 2`` heads):
-      ``GATv2Conv`` over an *extended* edge set that includes 2-hop
-      connections (pre-computed by the encoder) — giving each node an
-      effective 2-hop receptive field.  The global convolutions also use a
-      sharper LeakyReLU slope (``lrelu_slope * 1.5``) to bias them toward
-      attending to different features than the local branch.
-      Starting from the original features rather than local output removes
-      the trivial correlation between branches.
-
-    * **Per-head diverse initialisation**: unique scale factors and noise are
-      applied to each head's parameter slices after construction to break the
-      gradient symmetry that would otherwise keep heads identical throughout
-      training.
-
-    * **Scale combine** (per node type ``Linear(2·hidden → hidden)``):
-      Learns to weight local vs. global context.
-
-    Parameters
-    ----------
-    edge_types : list of (src, rel, dst) tuples
-    node_types : list of str
-    hidden_dim : int
-    num_heads : int
-        Total number of attention heads, split evenly between branches.
-    dropout : float
-    lrelu_slope : float
-        LeakyReLU negative slope for local branch.  Global uses
-        ``lrelu_slope * 1.5`` (matches the PoC ``negative_slope * 1.5``).
+    Manually iterates edge types (instead of HeteroConv) so that
+    ``return_attention_weights`` can be forwarded to each sub-conv.
+    Self-loops are enabled only for same-type edges.
     """
 
     def __init__(
@@ -257,130 +188,124 @@ class MultiScaleHeteroConv(nn.Module):
         global_head_dim = hidden_dim // global_heads
         global_slope = lrelu_slope * 1.5
 
-        local_dict: Dict[Tuple[str, str, str], GATv2Conv] = {}
-        global_dict: Dict[Tuple[str, str, str], GATv2Conv] = {}
+        self.local_convs = nn.ModuleDict()
+        self.global_convs = nn.ModuleDict()
+        self._et_keys: Dict[Tuple[str, str, str], str] = {}
+
         for et in edge_types:
-            local_dict[et] = GATv2Conv(
-                in_channels=hidden_dim,
+            src_type, rel, dst_type = et
+            key = f"{src_type}__{rel}__{dst_type}"
+            self._et_keys[et] = key
+            is_homo = (src_type == dst_type)
+
+            self.local_convs[key] = GATConv(
+                in_channels=(hidden_dim, hidden_dim),
                 out_channels=local_head_dim,
                 heads=local_heads,
                 concat=True,
                 dropout=dropout,
-                add_self_loops=False,
-                share_weights=False,
+                add_self_loops=is_homo,
                 negative_slope=lrelu_slope,
             )
-            global_dict[et] = GATv2Conv(
-                in_channels=hidden_dim,
+            self.global_convs[key] = GATConv(
+                in_channels=(hidden_dim, hidden_dim),
                 out_channels=global_head_dim,
                 heads=global_heads,
                 concat=True,
                 dropout=dropout,
-                add_self_loops=False,
-                share_weights=False,
-                negative_slope=global_slope,   # ← sharper slope biases to different features
+                add_self_loops=is_homo,
+                negative_slope=global_slope,
             )
 
-        self.local_conv = HeteroConv(local_dict, aggr="sum")
-        self.global_conv = HeteroConv(global_dict, aggr="sum")
-
-        # Learned combination: [local ∥ global] → hidden_dim
         self.scale_combine = nn.ModuleDict({
             ntype: nn.Linear(2 * hidden_dim, hidden_dim, bias=False)
             for ntype in node_types
         })
+
+        self.edge_types = edge_types
         self.node_types = node_types
 
-        # ── Break head symmetry ─────────────────────────────────────────
-        for sub_conv in (
-            list(self.local_conv.convs.values())
-            + list(self.global_conv.convs.values())
-        ):
-            _diversify_gatv2_heads(sub_conv)
+        # Per-head diverse init
+        for convs_dict in (self.local_convs, self.global_convs):
+            for sub_conv in convs_dict.values():
+                _diversify_gat_heads(sub_conv)
 
     def forward(
         self,
-        x_dict: Dict[str, "Tensor"],
+        x_dict: Dict[str, Tensor],
         edge_index_dict: Dict,
         global_edge_index_dict: Optional[Dict] = None,
-    ) -> Dict[str, "Tensor"]:
-        """Run both branches from ``x_dict`` with distinct edge sets.
+        return_attention_weights: bool = False,
+    ):
+        if global_edge_index_dict is None:
+            global_edge_index_dict = edge_index_dict
 
-        Parameters
-        ----------
-        x_dict : dict
-            Current node embeddings ``{ntype: Tensor[N, hidden_dim]}``.
-        edge_index_dict : dict
-            1-hop edge indices for local branch.
-        global_edge_index_dict : dict, optional
-            2-hop-augmented edge indices for global branch.  Falls back
-            to ``edge_index_dict`` when ``None``.
-        """
-        global_ei = global_edge_index_dict if global_edge_index_dict is not None else edge_index_dict
+        local_out: Dict[str, List[Tensor]] = defaultdict(list)
+        global_out: Dict[str, List[Tensor]] = defaultdict(list)
+        attn_dict: Dict[str, Tensor] = {}
 
-        # ── Local pass (1-hop, from x_dict) ───────────────────────────
-        h_local = self.local_conv(x_dict, edge_index_dict)
+        for et in self.edge_types:
+            key = self._et_keys[et]
+            src_type, rel, dst_type = et
+            if et not in edge_index_dict:
+                continue
+
+            x_src = x_dict[src_type]
+            x_dst = x_dict[dst_type]
+            ei = edge_index_dict[et]
+
+            # ---- Local conv ----
+            if return_attention_weights:
+                out_l, (_, alpha_l) = self.local_convs[key](
+                    (x_src, x_dst), ei, return_attention_weights=True,
+                )
+                attn_dict[f"local|{src_type}|{rel}|{dst_type}"] = alpha_l
+            else:
+                out_l = self.local_convs[key]((x_src, x_dst), ei)
+            local_out[dst_type].append(out_l)
+
+            # ---- Global conv ----
+            g_ei = global_edge_index_dict.get(et, ei)
+            if return_attention_weights:
+                out_g, (_, alpha_g) = self.global_convs[key](
+                    (x_src, x_dst), g_ei, return_attention_weights=True,
+                )
+                attn_dict[f"global|{src_type}|{rel}|{dst_type}"] = alpha_g
+            else:
+                out_g = self.global_convs[key]((x_src, x_dst), g_ei)
+            global_out[dst_type].append(out_g)
+
+        # ---- Aggregate and combine scales ----
+        result: Dict[str, Tensor] = {}
         for ntype in self.node_types:
-            if ntype not in h_local:
-                h_local[ntype] = x_dict[ntype]
+            if ntype in local_out and local_out[ntype]:
+                loc = torch.stack(local_out[ntype], dim=0).sum(dim=0)
+                glb = (
+                    torch.stack(global_out[ntype], dim=0).sum(dim=0)
+                    if ntype in global_out and global_out[ntype]
+                    else x_dict[ntype]
+                )
+                result[ntype] = self.scale_combine[ntype](
+                    torch.cat([loc, glb], dim=-1)
+                )
+            else:
+                result[ntype] = x_dict[ntype]
 
-        # ── Global pass (2-hop edges, also from x_dict) ────────────────
-        # Starting from x_dict (not h_local) removes the trivial correlation
-        # between branches — matching the PoC design.
-        h_global = self.global_conv(x_dict, global_ei)
-
-        # ── Combine scales ─────────────────────────────────────────────
-        out: Dict[str, Tensor] = {}
-        for ntype in self.node_types:
-            loc = h_local.get(ntype, x_dict[ntype])
-            glb = h_global.get(ntype, x_dict[ntype])
-            out[ntype] = self.scale_combine[ntype](
-                torch.cat([loc, glb], dim=-1)
-            )
-        return out
+        if return_attention_weights:
+            return result, attn_dict
+        return result
 
 
-# ────────────────────────────────────────────────────────────────────────
-# Heterogeneous RGAT Encoder
-# ────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------ #
+# Heterogeneous RGAT Encoder                                           #
+# ------------------------------------------------------------------ #
 
 class HeteroRGATEncoder(nn.Module):
-    """Multi-layer heterogeneous graph encoder with multi-scale GATv2 attention.
+    """Multi-layer heterogeneous encoder with multi-scale GATConv attention.
 
-    Each message-passing layer is a :class:`MultiScaleHeteroConv` that splits
-    the ``num_heads`` attention heads across two branches:
-
-    * **Local heads** (``num_heads // 2``): attend to direct 1-hop neighbours.
-    * **Global heads** (remaining): operate on the local output, capturing
-      an effective 2-hop neighbourhood context.
-
-    This partitioning prevents all heads from collapsing to the same
-    attention distribution, as each branch is structurally forced to look at
-    a different neighbourhood depth.
-
-    Parameters
-    ----------
-    node_types : list[str]
-        All node type labels.
-    edge_types : list[tuple[str, str, str]]
-        All ``(src, rel, dst)`` triplets (including reverse edges).
-    scalar_dims : dict[str, int]
-        Per-type scalar feature dimension.
-    sentence_dim : int
-        Dimension of pre-computed sentence embeddings (384 for MiniLM).
-    leiden_embed_dim : int
-        Dimension of the Leiden community embedding.
-    num_leiden_ids : int
-        Vocabulary size for the Leiden embedding table.
-    hidden_dim : int
-        Internal representation dimension (same for all types after projection).
-    num_heads : int
-        Total number of attention heads, split evenly between local and global
-        branches.  Must be even and ≥ 2.
-    num_layers : int
-        Number of stacked ``MultiScaleHeteroConv`` layers.
-    dropout : float
-        Dropout probability.
+    Uses GATConv (v1) with separate att_src / att_dst for better head
+    diversification.  Supports ``return_attention_weights`` for gradient-
+    connected diversity loss during training.
     """
 
     def __init__(
@@ -397,7 +322,6 @@ class HeteroRGATEncoder(nn.Module):
         dropout: float = 0.2,
     ) -> None:
         super().__init__()
-
         self.node_types = node_types
         self.edge_types = edge_types
         self.hidden_dim = hidden_dim
@@ -405,149 +329,119 @@ class HeteroRGATEncoder(nn.Module):
         self.num_layers = num_layers
         self.dropout = dropout
 
-        # ── Leiden community embedding (shared across all node types) ──
         self.leiden_embedding = nn.Embedding(
-            num_embeddings=num_leiden_ids,
-            embedding_dim=leiden_embed_dim,
-            padding_idx=0,   # index 0 = isolate bucket (-1 remapped)
+            num_leiden_ids, leiden_embed_dim, padding_idx=0,
         )
 
-        # ── Per-type input projection ──────────────────────────────────
         self.input_proj = nn.ModuleDict()
         for ntype in node_types:
             in_dim = scalar_dims[ntype] + sentence_dim + leiden_embed_dim
             self.input_proj[ntype] = nn.Linear(in_dim, hidden_dim)
 
-        # ── Stacked MultiScaleHeteroConv layers ───────────────────────
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
-
         for _ in range(num_layers):
-            self.convs.append(
-                MultiScaleHeteroConv(
-                    edge_types=edge_types,
-                    node_types=node_types,
-                    hidden_dim=hidden_dim,
-                    num_heads=num_heads,
-                    dropout=dropout,
-                )
-            )
-
-            # Per-type LayerNorm
-            norm_dict = nn.ModuleDict({
+            self.convs.append(MultiScaleHeteroConv(
+                edge_types=edge_types,
+                node_types=node_types,
+                hidden_dim=hidden_dim,
+                num_heads=num_heads,
+                dropout=dropout,
+            ))
+            self.norms.append(nn.ModuleDict({
                 ntype: nn.LayerNorm(hidden_dim) for ntype in node_types
-            })
-            self.norms.append(norm_dict)
+            }))
 
-    def forward(self, data: HeteroData) -> Dict[str, Tensor]:
-        """Run the encoder.
-
-        Parameters
-        ----------
-        data : HeteroData
-            Must have ``x_scalar``, ``x_text``, ``leiden_ids``, and
-            ``edge_index`` populated for every type.
-
-        Returns
-        -------
-        dict[str, Tensor]
-            Node embeddings ``{node_type: Tensor[N_type, hidden_dim]}``.
-        """
-        # ── Assemble per-type input features ───────────────────────────
+    def forward(
+        self, data: HeteroData, return_attention_weights: bool = False,
+    ):
+        # ---- Input projection ----
         x_dict: Dict[str, Tensor] = {}
         for ntype in self.node_types:
-            x_scalar = data[ntype].x_scalar              # [N, scalar_dim]
-            x_text = data[ntype].x_text                  # [N, sentence_dim]
-            leiden_ids = data[ntype].leiden_ids            # [N]
-            x_leiden = self.leiden_embedding(leiden_ids)   # [N, leiden_embed_dim]
-
-            x_cat = torch.cat([x_scalar, x_text, x_leiden], dim=-1)
+            x_cat = torch.cat([
+                data[ntype].x_scalar,
+                data[ntype].x_text,
+                self.leiden_embedding(data[ntype].leiden_ids),
+            ], dim=-1)
             x_dict[ntype] = self.input_proj[ntype](x_cat)
 
-        # ── Apply ReLU after projection ────────────────────────────────
         x_dict = {k: F.elu(v) for k, v in x_dict.items()}
 
-        # ── Message-passing layers ─────────────────────────────────────
+        # ---- Edge indices ----
         edge_index_dict = {
             et: data[et].edge_index
             for et in self.edge_types
             if hasattr(data[et], "edge_index")
         }
 
-        # ── Build / retrieve structural-role global edge index (cached) ─
-        # Compute once per unique data object using its id as cache key.
+        # ---- Structural-role global edges (cached per data object) ----
         data_id = id(data)
         if not hasattr(self, "_global_ei_cache") or self._global_ei_cache_id != data_id:
-            global_edge_index_dict: Dict = {}
+            global_ei: Dict = {}
             for et, ei in edge_index_dict.items():
                 src_type, _, dst_type = et
-                n_src = data[src_type].num_nodes
-                n_dst = data[dst_type].num_nodes
-                global_edge_index_dict[et] = _structural_global_edges(ei, n_src, n_dst)
-            self._global_ei_cache: Dict = global_edge_index_dict  # type: ignore[assignment]
-            self._global_ei_cache_id: int = data_id
+                global_ei[et] = _structural_global_edges(
+                    ei, data[src_type].num_nodes, data[dst_type].num_nodes,
+                )
+            self._global_ei_cache = global_ei
+            self._global_ei_cache_id = data_id
         else:
-            global_edge_index_dict = self._global_ei_cache
+            global_ei = self._global_ei_cache
+
+        all_attn: Dict[str, Tensor] = {}
 
         for i, (conv, norm_dict) in enumerate(zip(self.convs, self.norms)):
-            # Residual connection
             x_residual = x_dict
 
-            x_dict = conv(x_dict, edge_index_dict, global_edge_index_dict)
+            # Only collect attention from the first layer
+            if return_attention_weights and i == 0:
+                x_dict, layer_attn = conv(
+                    x_dict, edge_index_dict, global_ei,
+                    return_attention_weights=True,
+                )
+                all_attn = layer_attn
+            else:
+                x_dict = conv(x_dict, edge_index_dict, global_ei)
 
             # LayerNorm + residual + activation + dropout
-            # Skip ReLU on the last layer so embeddings can have negative
-            # values (needed for dot-product decoding to produce neg logits).
             is_last = (i == len(self.convs) - 1)
             new_x: Dict[str, Tensor] = {}
             for ntype in self.node_types:
                 if ntype in x_dict:
                     h = norm_dict[ntype](x_dict[ntype])
-                    h = h + x_residual[ntype]         # residual
+                    h = h + x_residual[ntype]
                     if not is_last:
                         h = F.elu(h)
                     h = F.dropout(h, p=self.dropout, training=self.training)
                     new_x[ntype] = h
                 else:
-                    # Node type might not appear as a target in any edge
                     new_x[ntype] = x_residual[ntype]
-
             x_dict = new_x
 
-        # ── L2-normalize output embeddings ─────────────────────────────
         x_dict = {k: F.normalize(v, p=2, dim=-1) for k, v in x_dict.items()}
 
+        if return_attention_weights:
+            return x_dict, all_attn
         return x_dict
 
 
-# ────────────────────────────────────────────────────────────────────────
-# Attention Diversity Loss
-# ────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------ #
+# Attention Diversity Loss                                             #
+# ------------------------------------------------------------------ #
 
 class AttentionDiversityLoss(nn.Module):
-    """Enhanced diversity loss combining three objectives on actual attention
-    output distributions (not just parameters).
+    """3-term diversity loss on actual attention outputs.
 
-    1. **Entropy**: penalises peaked attention (encourages each head to
-       spread weight across multiple neighbours).
-    2. **Head orthogonality**: penalises high cosine similarity between
-       pairs of attention heads so they attend to different neighbours.
-    3. **Gini sparsity**: alternates between encouraging sparse attention
-       (even heads) and uniform attention (odd heads) to enforce
-       complementary specialisations.
-
-    When ``cached_attn`` is empty (i.e. not yet populated by the training
-    loop) this falls back to the parameter-level orthogonality penalty.
+    Must be called with gradient-connected attention tensors (not under
+    torch.no_grad) for the loss to influence training.
     """
 
     def __init__(self) -> None:
         super().__init__()
-        # Filled by the training loop each forward pass
         self.cached_attn: Dict[str, Tensor] = {}
 
     @staticmethod
     def _gini(x: Tensor) -> Tensor:
-        """Differentiable Gini coefficient of a 1-D distribution."""
         sorted_x, _ = torch.sort(x)
         n = sorted_x.size(0)
         idx = torch.arange(1, n + 1, dtype=torch.float, device=x.device)
@@ -557,55 +451,50 @@ class AttentionDiversityLoss(nn.Module):
         gini = (2.0 * (idx * sorted_x).sum()) / (n * total) - (n + 1.0) / n
         return torch.clamp(gini, 0.0, 1.0)
 
-    def forward(self, encoder: "HeteroRGATEncoder") -> Tensor:  # type: ignore[override]
-        # ── If we have cached attention outputs, use output-based loss ──
+    def forward(self, encoder: HeteroRGATEncoder) -> Tensor:
         if self.cached_attn:
-            return self._output_based_loss(encoder)
-        # ── Fallback: parameter-level orthogonality ────────────────────
+            return self._output_based_loss()
         return self._param_level_loss(encoder)
 
-    def _output_based_loss(self, encoder: "HeteroRGATEncoder") -> Tensor:
-        device = next(encoder.parameters()).device
+    def _output_based_loss(self) -> Tensor:
+        device = next(iter(self.cached_attn.values())).device
         total_loss = torch.tensor(0.0, device=device)
         n_types = 0
 
-        num_heads = encoder.num_heads
-
-        for _key, attn_tensor in self.cached_attn.items():
-            # attn_tensor: [num_edges, num_heads]
-            if attn_tensor.dim() != 2 or attn_tensor.size(1) < 2:
-                continue
-            if attn_tensor.size(0) < 2:
+        for _key, attn in self.cached_attn.items():
+            if attn.dim() != 2 or attn.size(1) < 2 or attn.size(0) < 2:
                 continue
 
-            H = attn_tensor.size(1)
-            heads = attn_tensor.T  # [H, num_edges]
+            H = attn.size(1)
+            heads = attn.T  # [H, num_edges]
 
-            # ── 1. Entropy loss (encourage spread within each head) ────
+            # 1. Entropy loss
             entropy_loss = torch.tensor(0.0, device=device)
-            for h_idx in range(H):
-                p = F.softmax(heads[h_idx], dim=0)
+            for h in range(H):
+                p = F.softmax(heads[h], dim=0)
                 ent = -(p * torch.log(p + 1e-8)).sum()
                 max_ent = torch.log(torch.tensor(float(heads.size(1)), device=device))
                 entropy_loss = entropy_loss + (1.0 - ent / max_ent)
 
-            # ── 2. Head orthogonality loss ─────────────────────────────
-            ortho_loss = torch.tensor(0.0, device=device)
+            # 2. Head orthogonality
             heads_norm = F.normalize(heads, p=2, dim=1, eps=1e-8)
             sim = torch.mm(heads_norm, heads_norm.t())
             mask = ~torch.eye(H, dtype=torch.bool, device=device)
-            if mask.any():
-                ortho_loss = sim[mask].abs().mean()
+            ortho_loss = (
+                sim[mask].abs().mean()
+                if mask.any()
+                else torch.tensor(0.0, device=device)
+            )
 
-            # ── 3. Gini sparsity loss (alternate per head) ─────────────
+            # 3. Gini sparsity (alternate per head)
             gini_loss = torch.tensor(0.0, device=device)
-            for h_idx in range(H):
-                p = F.softmax(heads[h_idx], dim=0)
+            for h in range(H):
+                p = F.softmax(heads[h], dim=0)
                 g = self._gini(p)
-                if h_idx % 2 == 0:
-                    gini_loss = gini_loss + (1.0 - g)   # encourage sparse
+                if h % 2 == 0:
+                    gini_loss = gini_loss + (1.0 - g)
                 else:
-                    gini_loss = gini_loss + g            # encourage uniform
+                    gini_loss = gini_loss + g
 
             edge_loss = 0.3 * entropy_loss + 0.4 * ortho_loss + 0.3 * gini_loss
             if torch.isfinite(edge_loss):
@@ -618,29 +507,38 @@ class AttentionDiversityLoss(nn.Module):
             total_loss = torch.tensor(0.0, device=device)
         return total_loss
 
-    def _param_level_loss(self, encoder: "HeteroRGATEncoder") -> Tensor:
-        """Fallback: cosine-similarity penalty on parameter slices."""
+    def _param_level_loss(self, encoder: HeteroRGATEncoder) -> Tensor:
         terms: List[Tensor] = []
-
         for ms_conv in encoder.convs:
-            for hetero_conv in (ms_conv.local_conv, ms_conv.global_conv):
-                for sub_conv in hetero_conv.convs.values():
-                    H = sub_conv.att.shape[1]
+            for convs_dict in (ms_conv.local_convs, ms_conv.global_convs):
+                for sub_conv in convs_dict.values():
+                    if not hasattr(sub_conv, "att_src"):
+                        continue
+                    H = sub_conv.att_src.shape[1]
                     if H < 2:
                         continue
+                    mask = ~torch.eye(H, dtype=torch.bool, device=sub_conv.att_src.device)
 
-                    mask = ~torch.eye(H, dtype=torch.bool, device=sub_conv.att.device)
+                    # att_src similarity
+                    src_heads = sub_conv.att_src[0]
+                    src_norm = F.normalize(src_heads, p=2, dim=1, eps=1e-8)
+                    sim_src = torch.mm(src_norm, src_norm.t())
+                    terms.append(sim_src[mask].abs().mean())
 
-                    heads = sub_conv.att[0]          # [H, C]
-                    heads_norm = F.normalize(heads, p=2, dim=1, eps=1e-8)
-                    sim = torch.mm(heads_norm, heads_norm.t())
-                    terms.append(sim[mask].abs().mean())
+                    # att_dst similarity
+                    dst_heads = sub_conv.att_dst[0]
+                    dst_norm = F.normalize(dst_heads, p=2, dim=1, eps=1e-8)
+                    sim_dst = torch.mm(dst_norm, dst_norm.t())
+                    terms.append(sim_dst[mask].abs().mean())
 
-                    for lin in (sub_conv.lin_l, sub_conv.lin_r):
+                    # Linear weight similarity
+                    for lin in (sub_conv.lin_src, sub_conv.lin_dst):
+                        if lin is None or not hasattr(lin, "weight"):
+                            continue
                         w = lin.weight
-                        H_C, in_dim = w.shape
+                        H_C = w.shape[0]
                         C = H_C // H
-                        w_per_head = w.view(H, C * in_dim)
+                        w_per_head = w.view(H, C * w.shape[1])
                         w_norm = F.normalize(w_per_head, p=2, dim=1, eps=1e-8)
                         sim_w = torch.mm(w_norm, w_norm.t())
                         terms.append(sim_w[mask].abs().mean())
@@ -648,38 +546,15 @@ class AttentionDiversityLoss(nn.Module):
         if not terms:
             device = next(encoder.parameters()).device
             return torch.tensor(0.0, device=device)
-
         return torch.stack(terms).mean()
 
 
-# ────────────────────────────────────────────────────────────────────────
-# Link Predictor (dot-product decoder)
-# ────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------ #
+# Link Predictor (dot-product decoder)                                 #
+# ------------------------------------------------------------------ #
 
 class LinkPredictor(nn.Module):
-    """Dot-product link predictor.
+    """Dot-product link predictor."""
 
-    Given source and target node embeddings, returns a scalar logit per
-    candidate edge.  Designed to be paired with ``BCEWithLogitsLoss``.
-    """
-
-    def forward(
-        self,
-        z_src: Tensor,
-        z_dst: Tensor,
-    ) -> Tensor:
-        """Compute link logits.
-
-        Parameters
-        ----------
-        z_src : Tensor[B, D]
-            Source node embeddings for the candidate edges.
-        z_dst : Tensor[B, D]
-            Target node embeddings for the candidate edges.
-
-        Returns
-        -------
-        Tensor[B]
-            Scalar logits (higher = more likely linked).
-        """
+    def forward(self, z_src: Tensor, z_dst: Tensor) -> Tensor:
         return (z_src * z_dst).sum(dim=-1)

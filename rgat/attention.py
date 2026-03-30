@@ -79,7 +79,7 @@ def get_attention_weights(
             leiden_ids = data[ntype].leiden_ids
             x_leiden = encoder.leiden_embedding(leiden_ids)
             x_cat = torch.cat([x_scalar, x_text, x_leiden], dim=-1)
-            x_dict[ntype] = F.relu(encoder.input_proj[ntype](x_cat))
+            x_dict[ntype] = F.elu(encoder.input_proj[ntype](x_cat))
 
         edge_index_dict = {
             et: data[et].edge_index
@@ -105,11 +105,13 @@ def get_attention_weights(
 
             # ── LOCAL PASS: 1-hop sub-convs ────────────────────────────
             local_out_dict: Dict[str, List[Tensor]] = {}
-            for edge_type, sub_conv in ms_conv.local_conv.convs.items():
-                src_type, rel, dst_type = edge_type
-                if edge_type not in edge_index_dict:
+            for et in ms_conv.edge_types:
+                key = ms_conv._et_keys[et]
+                src_type, rel, dst_type = et
+                if et not in edge_index_dict:
                     continue
-                ei = edge_index_dict[edge_type]
+                ei = edge_index_dict[et]
+                sub_conv = ms_conv.local_convs[key]
                 result = sub_conv(
                     (x_dict[src_type], x_dict[dst_type]), ei,
                     return_attention_weights=True,
@@ -134,13 +136,15 @@ def get_attention_weights(
                 else:
                     h_local[ntype] = x_dict[ntype]
 
-            # ── GLOBAL PASS: 2-hop sub-convs (operate on x_dict, not h_local) ─
+            # ── GLOBAL PASS: augmented sub-convs (operate on x_dict) ───
             global_out_dict: Dict[str, List[Tensor]] = {}
-            for edge_type, sub_conv in ms_conv.global_conv.convs.items():
-                src_type, rel, dst_type = edge_type
-                if edge_type not in global_edge_index_dict:
+            for et in ms_conv.edge_types:
+                key = ms_conv._et_keys[et]
+                src_type, rel, dst_type = et
+                if et not in global_edge_index_dict:
                     continue
-                ei = global_edge_index_dict[edge_type]
+                ei = global_edge_index_dict[et]
+                sub_conv = ms_conv.global_convs[key]
                 result = sub_conv(
                     (x_dict[src_type], x_dict[dst_type]), ei,
                     return_attention_weights=True,
@@ -172,7 +176,7 @@ def get_attention_weights(
                 h = norm_dict[ntype](h)
                 h = h + x_residual[ntype]
                 if not is_last:
-                    h = F.relu(h)
+                    h = F.elu(h)
                 new_x[ntype] = h
             x_dict = new_x
 
