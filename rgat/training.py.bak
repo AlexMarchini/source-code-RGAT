@@ -1,18 +1,15 @@
 """
-rgat.training – Training loop, evaluation, and metric computation (v2).
+rgat.training – Training loop, evaluation, and metric computation.
 
-Changes from v1:
-- Supports RelationDecoder (DistMult/bilinear) as well as legacy LinkPredictor
-- Auxiliary supervision: same-repo prediction, degree-bucket prediction
-- Diversity metric logging per edge type
-- Structured attention collection from all layers
+Provides a full-batch training pipeline for masked link prediction on a
+heterogeneous graph.  Reports per-relation and aggregate metrics including
+loss, accuracy, ROC-AUC, and average precision.
 """
 
 from __future__ import annotations
 
-import math
 import time
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -22,19 +19,7 @@ from torch_geometric.data import HeteroData
 from sklearn.metrics import average_precision_score, roc_auc_score
 
 from rgat.config import RGATConfig
-from rgat.model import (
-    AttentionDiversityLoss,
-    DegreeBucketHead,
-    HeteroRGATEncoder,
-    LinkPredictor,
-    RelationDecoder,
-    SameRepoHead,
-    compute_diversity_metrics,
-)
-
-
-# Type alias for the decoder (supports both old and new)
-Decoder = Union[RelationDecoder, LinkPredictor]
+from rgat.model import AttentionDiversityLoss, HeteroRGATEncoder, LinkPredictor
 
 
 # ── Metric container ───────────────────────────────────────────────────
@@ -61,7 +46,7 @@ class Metrics:
 
 def evaluate_link_prediction(
     encoder: HeteroRGATEncoder,
-    predictor: Decoder,
+    predictor: LinkPredictor,
     data: HeteroData,
     supervised_triplets: List[Tuple[str, str, str]],
     criterion: nn.Module,
@@ -71,7 +56,7 @@ def evaluate_link_prediction(
     Parameters
     ----------
     encoder : HeteroRGATEncoder
-    predictor : RelationDecoder or LinkPredictor
+    predictor : LinkPredictor
     data : HeteroData
         Must have ``edge_label_index`` and ``edge_label`` on supervised
         triplets.
@@ -88,8 +73,7 @@ def evaluate_link_prediction(
         Summed loss across all supervised triplets.
     """
     encoder.eval()
-    if hasattr(predictor, "eval"):
-        predictor.eval()
+    predictor.eval()
 
     with torch.no_grad():
         z_dict = encoder(data)
@@ -113,13 +97,13 @@ def evaluate_link_prediction(
         z_src = z_dict[src_type][edge_label_index[0]]
         z_dst = z_dict[dst_type][edge_label_index[1]]
 
-        logits = _decode(predictor, z_src, z_dst, triplet)
+        logits = predictor(z_src, z_dst)
         loss = criterion(logits, edge_label)
 
         # Detach for metric computation
-        probs_np = torch.sigmoid(logits).detach().cpu().numpy()
-        logits_np = logits.detach().cpu().numpy()
-        labels_np = edge_label.detach().cpu().numpy()
+        probs_np = torch.sigmoid(logits).cpu().numpy()
+        logits_np = logits.cpu().numpy()
+        labels_np = edge_label.cpu().numpy()
         preds_np = (probs_np >= 0.5).astype(float)
 
         m = Metrics()
@@ -145,12 +129,10 @@ def evaluate_link_prediction(
 
 def train(
     encoder: HeteroRGATEncoder,
-    predictor: Decoder,
+    predictor: LinkPredictor,
     train_data: HeteroData,
     val_data: HeteroData,
     config: RGATConfig,
-    same_repo_head: Optional[SameRepoHead] = None,
-    degree_head: Optional[DegreeBucketHead] = None,
 ) -> Dict[str, list]:
     """Run the full training loop.
 
@@ -159,28 +141,19 @@ def train(
     encoder, predictor : nn.Module
     train_data, val_data : HeteroData
     config : RGATConfig
-    same_repo_head : SameRepoHead, optional
-        Auxiliary head for same-repo prediction.
-    degree_head : DegreeBucketHead, optional
-        Auxiliary head for degree-bucket prediction.
 
     Returns
     -------
     history : dict
         Training history with keys ``"epoch"``, ``"train_loss"``,
-        ``"val_loss"``, ``"val_auc"``, ``"val_ap"``, ``"diversity_metrics"``,
-        and per-relation metrics.
+        ``"val_loss"``, ``"val_auc"``, ``"val_ap"``, and per-relation
+        metrics.
     """
     device = torch.device(config.device)
     encoder = encoder.to(device)
     predictor = predictor.to(device)
     train_data = train_data.to(device)
     val_data = val_data.to(device)
-
-    if same_repo_head is not None:
-        same_repo_head = same_repo_head.to(device)
-    if degree_head is not None:
-        degree_head = degree_head.to(device)
 
     # ── Identify supervised triplets from train_data ───────────────────
     supervised_triplets: List[Tuple[str, str, str]] = []
@@ -196,29 +169,15 @@ def train(
 
     print(f"[training] Supervised triplets: {supervised_triplets}")
     print(f"[training] Device: {device}")
-    print(f"[training] Decoder type: {config.decoder_type}")
-    print(f"[training] Aux same-repo weight: {config.aux_same_repo_weight}")
-    print(f"[training] Aux degree weight: {config.aux_degree_weight}")
 
     # ── Optimizer and loss ─────────────────────────────────────────────
     params = list(encoder.parameters()) + list(predictor.parameters())
-    if same_repo_head is not None:
-        params += list(same_repo_head.parameters())
-    if degree_head is not None:
-        params += list(degree_head.parameters())
     optimizer = torch.optim.Adam(params, lr=config.lr, weight_decay=config.weight_decay)
     criterion = nn.BCEWithLogitsLoss()
 
     # ── Attention diversity regulariser ────────────────────────────────
     use_diversity = config.diversity_loss_weight > 0
-    diversity_criterion = None
-    if use_diversity:
-        diversity_criterion = AttentionDiversityLoss(
-            ortho_weight=config.diversity_ortho_weight,
-            variance_weight=config.diversity_variance_weight,
-            coverage_weight=config.diversity_coverage_weight,
-            num_layers=config.num_layers,
-        ).to(device)
+    diversity_criterion = AttentionDiversityLoss().to(device) if use_diversity else None
 
     # ── History ────────────────────────────────────────────────────────
     history: Dict[str, list] = {
@@ -227,7 +186,6 @@ def train(
         "val_loss": [],
         "val_auc": [],
         "val_ap": [],
-        "diversity_metrics": [],
     }
 
     best_val_auc = 0.0
@@ -237,12 +195,7 @@ def train(
     for epoch in range(1, config.epochs + 1):
         t0 = time.perf_counter()
         encoder.train()
-        if hasattr(predictor, "train"):
-            predictor.train()
-        if same_repo_head is not None:
-            same_repo_head.train()
-        if degree_head is not None:
-            degree_head.train()
+        predictor.train()
         optimizer.zero_grad()
 
         # Forward — request attention weights when diversity loss is active
@@ -267,32 +220,15 @@ def train(
             z_src = z_dict[src_type][edge_label_index[0]]
             z_dst = z_dict[dst_type][edge_label_index[1]]
 
-            logits = _decode(predictor, z_src, z_dst, triplet)
+            logits = predictor(z_src, z_dst)
             loss = criterion(logits, edge_label)
             total_loss = total_loss + loss
 
         # ── Attention diversity regularisation (gradient-connected) ──
-        if need_attn and attn_dict and diversity_criterion is not None:
+        if need_attn and attn_dict:
             diversity_criterion.cached_attn = attn_dict
             div_loss = diversity_criterion(encoder)
             total_loss = total_loss + config.diversity_loss_weight * div_loss
-
-        # ── Auxiliary: same-repo prediction ──────────────────────────
-        if same_repo_head is not None and config.aux_same_repo_weight > 0:
-            aux_repo_loss = _compute_same_repo_loss(
-                same_repo_head, z_dict, train_data, supervised_triplets, device
-            )
-            if aux_repo_loss is not None:
-                total_loss = total_loss + config.aux_same_repo_weight * aux_repo_loss
-
-        # ── Auxiliary: degree-bucket prediction ──────────────────────
-        if degree_head is not None and config.aux_degree_weight > 0:
-            aux_deg_loss = _compute_degree_loss(
-                degree_head, z_dict, train_data, device,
-                num_buckets=config.aux_degree_num_buckets,
-            )
-            if aux_deg_loss is not None:
-                total_loss = total_loss + config.aux_degree_weight * aux_deg_loss
 
         total_loss.backward()
         optimizer.step()
@@ -321,23 +257,6 @@ def train(
             history["val_auc"].append(agg_auc)
             history["val_ap"].append(agg_ap)
 
-            # ── Diversity metrics logging ──────────────────────────────
-            div_metrics: Dict[str, float] = {}
-            if attn_dict:
-                div_metrics = compute_diversity_metrics(attn_dict)
-                # Print summary stats
-                cos_sims = [v for k, v in div_metrics.items() if k.endswith("/cosine_sim")]
-                entropies = [v for k, v in div_metrics.items() if k.endswith("/mean_entropy")]
-                variances = [v for k, v in div_metrics.items() if k.endswith("/mean_variance")]
-                if cos_sims:
-                    import numpy as np
-                    print(
-                        f"    [diversity] cos_sim={np.mean(cos_sims):.4f}  "
-                        f"entropy={np.mean(entropies):.4f}  "
-                        f"variance={np.mean(variances):.6f}"
-                    )
-            history["diversity_metrics"].append(div_metrics)
-
             # Print epoch summary
             print(
                 f"  Epoch {epoch:>4d}/{config.epochs} | "
@@ -355,9 +274,7 @@ def train(
             if agg_auc > best_val_auc:
                 best_val_auc = agg_auc
                 patience_counter = 0
-                _save_checkpoint(encoder, predictor, config,
-                                 same_repo_head=same_repo_head,
-                                 degree_head=degree_head)
+                _save_checkpoint(encoder, predictor, config)
             else:
                 patience_counter += 1
                 if patience_counter >= config.patience:
@@ -378,79 +295,7 @@ def train(
     return history
 
 
-# ── Internal helpers ───────────────────────────────────────────────────
-
-def _decode(
-    predictor: Decoder,
-    z_src: Tensor,
-    z_dst: Tensor,
-    triplet: Tuple[str, str, str],
-) -> Tensor:
-    """Call the decoder, handling both RelationDecoder and LinkPredictor."""
-    if isinstance(predictor, RelationDecoder):
-        return predictor(z_src, z_dst, triplet)
-    return predictor(z_src, z_dst)
-
-
-def _compute_same_repo_loss(
-    head: SameRepoHead,
-    z_dict: Dict[str, Tensor],
-    data: HeteroData,
-    supervised_triplets: List[Tuple[str, str, str]],
-    device: torch.device,
-) -> Optional[Tensor]:
-    """Compute same-repo auxiliary loss across supervised edges."""
-    criterion = nn.BCEWithLogitsLoss()
-    losses = []
-
-    for triplet in supervised_triplets:
-        src_type, rel, dst_type = triplet
-        store = data[triplet]
-        if not hasattr(store, "same_repo_label"):
-            continue
-
-        # Use edge_index (message-passing edges), NOT edge_label_index
-        # which includes negatives and doesn't align with same_repo_label.
-        edge_index = store.edge_index
-        same_repo = store.same_repo_label.float()
-
-        if same_repo.numel() == 0:
-            continue
-
-        z_src = z_dict[src_type][edge_index[0]]
-        z_dst = z_dict[dst_type][edge_index[1]]
-        logits = head(z_src, z_dst)
-        losses.append(criterion(logits, same_repo))
-
-    if not losses:
-        return None
-    return torch.stack(losses).mean()
-
-
-def _compute_degree_loss(
-    head: DegreeBucketHead,
-    z_dict: Dict[str, Tensor],
-    data: HeteroData,
-    device: torch.device,
-    num_buckets: int = 6,
-) -> Optional[Tensor]:
-    """Compute degree-bucket auxiliary loss on node types with degree info."""
-    criterion = nn.CrossEntropyLoss()
-    losses = []
-
-    for ntype, z in z_dict.items():
-        if not hasattr(data[ntype], "degree_bucket"):
-            continue
-        labels = data[ntype].degree_bucket
-        if labels.numel() == 0:
-            continue
-        logits = head(z)
-        losses.append(criterion(logits, labels))
-
-    if not losses:
-        return None
-    return torch.stack(losses).mean()
-
+# ── Helpers ────────────────────────────────────────────────────────────
 
 def _fmt(triplet: Tuple[str, str, str]) -> str:
     return f"({triplet[0]}, {triplet[1]}, {triplet[2]})"
@@ -458,22 +303,18 @@ def _fmt(triplet: Tuple[str, str, str]) -> str:
 
 def _save_checkpoint(
     encoder: HeteroRGATEncoder,
-    predictor: Decoder,
+    predictor: LinkPredictor,
     config: RGATConfig,
-    same_repo_head: Optional[SameRepoHead] = None,
-    degree_head: Optional[DegreeBucketHead] = None,
 ) -> None:
     """Save model checkpoint."""
     import os
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     path = os.path.join(config.checkpoint_dir, "best_model.pt")
-    ckpt = {
-        "encoder_state_dict": encoder.state_dict(),
-        "predictor_state_dict": predictor.state_dict(),
-    }
-    if same_repo_head is not None:
-        ckpt["same_repo_head_state_dict"] = same_repo_head.state_dict()
-    if degree_head is not None:
-        ckpt["degree_head_state_dict"] = degree_head.state_dict()
-    torch.save(ckpt, path)
+    torch.save(
+        {
+            "encoder_state_dict": encoder.state_dict(),
+            "predictor_state_dict": predictor.state_dict(),
+        },
+        path,
+    )
     print(f"    [checkpoint] Saved best model to {path}")

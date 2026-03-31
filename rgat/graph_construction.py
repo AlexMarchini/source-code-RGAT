@@ -21,6 +21,8 @@ from torch_geometric.data import HeteroData
 
 from rgat.config import REQUIRED_SCALAR_FEATURES, RGATConfig
 
+import math
+
 
 # ── Public return type ─────────────────────────────────────────────────
 NodeIndex = Dict[str, Dict[str, int]]   # {node_type: {node_id: int_index}}
@@ -153,7 +155,55 @@ def build_hetero_data(
         data[dst_type, rev_rel, src_type].edge_index = rev_edge_index
         reverse_groups[rev_triplet] = rev_edge_index
 
-    # ── 5. Print dataset summary ───────────────────────────────────────
+    # ── 5. Same-repo labels (for auxiliary supervision) ────────────────
+    # Node IDs follow format: type::repo_name::module_path::entity_name
+    # Extract repo name from second segment and produce binary labels.
+    def _repo_of(node_id: str) -> str:
+        parts = node_id.split("::")
+        return parts[1] if len(parts) >= 2 else ""
+
+    # Build int_idx -> repo_name mapping per type
+    idx_to_repo: Dict[str, Dict[int, str]] = {}
+    for ntype, nlist in nodes_by_type.items():
+        idx_to_repo[ntype] = {}
+        for node in nlist:
+            idx = node_index[ntype][node["id"]]
+            idx_to_repo[ntype][idx] = _repo_of(node["id"])
+
+    # For each edge triplet (original + reverse), compute same-repo labels
+    all_triplets = list(edge_groups.keys()) + list(reverse_groups.keys())
+    for triplet in all_triplets:
+        src_type, rel, dst_type = triplet
+        ei = data[triplet].edge_index
+        n_edges = ei.shape[1]
+        same_repo = torch.zeros(n_edges, dtype=torch.float32)
+        src_repos = idx_to_repo.get(src_type, {})
+        dst_repos = idx_to_repo.get(dst_type, {})
+        for e in range(n_edges):
+            s = int(ei[0, e])
+            d = int(ei[1, e])
+            if src_repos.get(s, "") == dst_repos.get(d, "") and src_repos.get(s, "") != "":
+                same_repo[e] = 1.0
+        data[triplet].same_repo_label = same_repo
+
+    # ── 6. Degree buckets (for auxiliary supervision) ──────────────────
+    # Discretise in-degree into log-scale buckets for node types that
+    # have in_degree as a scalar feature.
+    _DEGREE_FEATURE = "in_degree"
+    num_buckets = 6
+    for ntype, nlist in nodes_by_type.items():
+        scalar_keys = REQUIRED_SCALAR_FEATURES[ntype]
+        if _DEGREE_FEATURE not in scalar_keys:
+            continue
+        n_nodes = len(nlist)
+        buckets = torch.zeros(n_nodes, dtype=torch.long)
+        for i, node in enumerate(nlist):
+            deg = float(node["features"].get(_DEGREE_FEATURE, 0))
+            bucket = min(int(math.log2(deg + 1)), num_buckets - 1)
+            buckets[i] = bucket
+        data[ntype].degree_bucket = buckets
+
+    # ── 7. Print dataset summary ───────────────────────────────────────
     _print_summary(data, nodes_by_type, edge_groups, reverse_groups, config)
 
     return data, node_index

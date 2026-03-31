@@ -105,6 +105,23 @@ class RGATConfig:
     diversity_loss_weight: float = 1.0  # weight for attention diversity regulariser (0 = disabled)
     diversity_warmup_epochs: int = 10    # apply diversity loss only after this many epochs
 
+    # ── Diversity loss term weights (must sum to ~1.0) ─────────────────
+    diversity_ortho_weight: float = 0.5     # head orthogonality (primary)
+    diversity_variance_weight: float = 0.3  # head variance maximisation
+    diversity_coverage_weight: float = 0.2  # complementary coverage
+
+    # ── Decoder ────────────────────────────────────────────────────────
+    decoder_type: str = "distmult"  # "distmult" or "bilinear"
+
+    # ── Auxiliary supervision ──────────────────────────────────────────
+    aux_same_repo_weight: float = 0.1  # same-repo prediction (0 = disabled)
+    aux_degree_weight: float = 0.0     # degree-bucket prediction (0 = disabled)
+    aux_degree_num_buckets: int = 6    # number of log-degree buckets
+
+    # ── Attention collection ───────────────────────────────────────────
+    # None = collect from all layers; tuple of ints = specific layers only
+    collect_attention_layers: Optional[Tuple[int, ...]] = None
+
     # ── Link prediction ────────────────────────────────────────────────
     val_ratio: float = 0.15
     neg_sampling_ratio: float = 1.0

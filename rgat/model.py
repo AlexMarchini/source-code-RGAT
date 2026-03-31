@@ -1,5 +1,15 @@
 """
-rgat.model -- Heterogeneous RGAT encoder and link-prediction decoder.
+rgat.model -- Heterogeneous RGAT encoder and link-prediction decoder (v2).
+
+Changes from v1
+----------------
+- Multi-layer attention collection (configurable which layers)
+- Gated per-relation aggregation (replaces plain sum)
+- Learned sigmoid gate for local/global branch combination
+- Relation-specific decoder (DistMult or bilinear)
+- Improved AttentionDiversityLoss (orthogonality + variance + coverage)
+- Optional auxiliary heads (same-repo, degree-bucket)
+- Structured attention output: Dict[int, Dict[str, Tensor]]
 
 Architecture
 ------------
@@ -9,10 +19,11 @@ Architecture
    - Global branch (remaining heads): structural-role augmented edges
    - Self-loops on same-type edges only
    - Per-head diverse initialisation of att_src / att_dst
-   - Per-type scale_combine: [local || global] -> hidden_dim
+   - Learned per-relation gating before aggregation
+   - Sigmoid gate for local/global combination
 3. LayerNorm + residual + ELU + dropout between layers
 4. L2-normalised output embeddings
-5. Dot-product LinkPredictor
+5. Relation-specific decoder (DistMult default)
 """
 
 from __future__ import annotations
@@ -164,11 +175,13 @@ def _structural_global_edges(
 # ------------------------------------------------------------------ #
 
 class MultiScaleHeteroConv(nn.Module):
-    """Two-scale GATConv (v1) with separate att_src / att_dst per head.
+    """Two-scale GATConv (v1) with gated per-relation aggregation and
+    learned local/global combination.
 
-    Manually iterates edge types (instead of HeteroConv) so that
-    ``return_attention_weights`` can be forwarded to each sub-conv.
-    Self-loops are enabled only for same-type edges.
+    Changes from v1:
+    - Per-relation softmax gates (replaces plain sum over relations)
+    - Sigmoid gate for local/global combination (replaces concat+linear)
+    - Gate values stored for interpretability
     """
 
     def __init__(
@@ -217,13 +230,42 @@ class MultiScaleHeteroConv(nn.Module):
                 negative_slope=global_slope,
             )
 
-        self.scale_combine = nn.ModuleDict({
-            ntype: nn.Linear(2 * hidden_dim, hidden_dim, bias=False)
+        # ── Per-relation gating ──────────────────────────────────────
+        # For each destination node type, learn a weight per incoming relation.
+        # We build the mapping: dst_type -> list of relation keys that target it.
+        self._dst_to_rels: Dict[str, List[str]] = defaultdict(list)
+        for et in edge_types:
+            src_type, rel, dst_type = et
+            key = self._et_keys[et]
+            self._dst_to_rels[dst_type].append(key)
+
+        # Gate parameters: one learnable scalar per incoming relation per dst type
+        self.relation_gates = nn.ParameterDict()
+        for ntype in node_types:
+            n_rels = len(self._dst_to_rels[ntype])
+            if n_rels > 0:
+                # Initialise uniformly so initial behaviour ≈ mean
+                self.relation_gates[ntype] = nn.Parameter(
+                    torch.zeros(n_rels)
+                )
+
+        # ── Learned local/global sigmoid gate ────────────────────────
+        # gate = sigmoid(gate_proj(cat([local, global])))
+        # combined = gate * local + (1 - gate) * global
+        self.gate_proj = nn.ModuleDict({
+            ntype: nn.Linear(2 * hidden_dim, hidden_dim)
+            for ntype in node_types
+        })
+        self.output_proj = nn.ModuleDict({
+            ntype: nn.Linear(hidden_dim, hidden_dim, bias=False)
             for ntype in node_types
         })
 
         self.edge_types = edge_types
         self.node_types = node_types
+
+        # Store last gate values for interpretability
+        self.last_branch_gate: Dict[str, Tensor] = {}
 
         # Per-head diverse init
         for convs_dict in (self.local_convs, self.global_convs):
@@ -240,8 +282,9 @@ class MultiScaleHeteroConv(nn.Module):
         if global_edge_index_dict is None:
             global_edge_index_dict = edge_index_dict
 
-        local_out: Dict[str, List[Tensor]] = defaultdict(list)
-        global_out: Dict[str, List[Tensor]] = defaultdict(list)
+        # Collect per-relation outputs keyed by (dst_type, rel_key)
+        local_per_rel: Dict[str, Dict[str, Tensor]] = defaultdict(dict)
+        global_per_rel: Dict[str, Dict[str, Tensor]] = defaultdict(dict)
         attn_dict: Dict[str, Tensor] = {}
 
         for et in self.edge_types:
@@ -262,7 +305,7 @@ class MultiScaleHeteroConv(nn.Module):
                 attn_dict[f"local|{src_type}|{rel}|{dst_type}"] = alpha_l
             else:
                 out_l = self.local_convs[key]((x_src, x_dst), ei)
-            local_out[dst_type].append(out_l)
+            local_per_rel[dst_type][key] = out_l
 
             # ---- Global conv ----
             g_ei = global_edge_index_dict.get(et, ei)
@@ -273,23 +316,56 @@ class MultiScaleHeteroConv(nn.Module):
                 attn_dict[f"global|{src_type}|{rel}|{dst_type}"] = alpha_g
             else:
                 out_g = self.global_convs[key]((x_src, x_dst), g_ei)
-            global_out[dst_type].append(out_g)
+            global_per_rel[dst_type][key] = out_g
 
-        # ---- Aggregate and combine scales ----
+        # ---- Gated per-relation aggregation + local/global combine ----
         result: Dict[str, Tensor] = {}
         for ntype in self.node_types:
-            if ntype in local_out and local_out[ntype]:
-                loc = torch.stack(local_out[ntype], dim=0).sum(dim=0)
-                glb = (
-                    torch.stack(global_out[ntype], dim=0).sum(dim=0)
-                    if ntype in global_out and global_out[ntype]
-                    else x_dict[ntype]
-                )
-                result[ntype] = self.scale_combine[ntype](
-                    torch.cat([loc, glb], dim=-1)
-                )
-            else:
+            rel_keys = self._dst_to_rels[ntype]
+
+            if not rel_keys or ntype not in local_per_rel:
                 result[ntype] = x_dict[ntype]
+                continue
+
+            # Collect per-relation outputs that are actually present
+            present_local = []
+            present_global = []
+            present_indices = []
+            for idx, rk in enumerate(rel_keys):
+                if rk in local_per_rel[ntype]:
+                    present_local.append(local_per_rel[ntype][rk])
+                    present_global.append(
+                        global_per_rel[ntype].get(rk, local_per_rel[ntype][rk])
+                    )
+                    present_indices.append(idx)
+
+            if not present_local:
+                result[ntype] = x_dict[ntype]
+                continue
+
+            # Apply per-relation softmax gates
+            if len(present_local) > 1:
+                gate_logits = self.relation_gates[ntype][present_indices]
+                gate_weights = F.softmax(gate_logits, dim=0)  # [n_present]
+                # Weighted sum: [n_present, N, D] * [n_present, 1, 1]
+                local_stack = torch.stack(present_local, dim=0)   # [R, N, D]
+                global_stack = torch.stack(present_global, dim=0)
+                gw = gate_weights.view(-1, 1, 1)
+                loc = (local_stack * gw).sum(dim=0)   # [N, D]
+                glb = (global_stack * gw).sum(dim=0)
+            else:
+                loc = present_local[0]
+                glb = present_global[0]
+
+            # Sigmoid gate for local/global combination
+            gate = torch.sigmoid(
+                self.gate_proj[ntype](torch.cat([loc, glb], dim=-1))
+            )  # [N, hidden_dim]
+            combined = gate * loc + (1.0 - gate) * glb
+            result[ntype] = self.output_proj[ntype](combined)
+
+            # Store gate for inspection
+            self.last_branch_gate[ntype] = gate.detach()
 
         if return_attention_weights:
             return result, attn_dict
@@ -303,9 +379,9 @@ class MultiScaleHeteroConv(nn.Module):
 class HeteroRGATEncoder(nn.Module):
     """Multi-layer heterogeneous encoder with multi-scale GATConv attention.
 
-    Uses GATConv (v1) with separate att_src / att_dst for better head
-    diversification.  Supports ``return_attention_weights`` for gradient-
-    connected diversity loss during training.
+    Changes from v1:
+    - Collects attention from all layers (or configurable subset)
+    - Structured attention output: Dict[int, Dict[str, Tensor]]
     """
 
     def __init__(
@@ -320,6 +396,7 @@ class HeteroRGATEncoder(nn.Module):
         num_heads: int = 4,
         num_layers: int = 2,
         dropout: float = 0.2,
+        collect_attention_layers: Optional[Tuple[int, ...]] = None,
     ) -> None:
         super().__init__()
         self.node_types = node_types
@@ -328,6 +405,8 @@ class HeteroRGATEncoder(nn.Module):
         self.num_heads = num_heads
         self.num_layers = num_layers
         self.dropout = dropout
+        # Which layers to collect attention from (None = all)
+        self.collect_attention_layers = collect_attention_layers
 
         self.leiden_embedding = nn.Embedding(
             num_leiden_ids, leiden_embed_dim, padding_idx=0,
@@ -335,6 +414,11 @@ class HeteroRGATEncoder(nn.Module):
 
         self.input_proj = nn.ModuleDict()
         for ntype in node_types:
+            if ntype not in scalar_dims:
+                raise ValueError(
+                    f"Missing scalar_dims for node type '{ntype}'. "
+                    f"Available: {list(scalar_dims.keys())}"
+                )
             in_dim = scalar_dims[ntype] + sentence_dim + leiden_embed_dim
             self.input_proj[ntype] = nn.Linear(in_dim, hidden_dim)
 
@@ -352,16 +436,29 @@ class HeteroRGATEncoder(nn.Module):
                 ntype: nn.LayerNorm(hidden_dim) for ntype in node_types
             }))
 
+    def _should_collect_attn(self, layer_idx: int) -> bool:
+        """Whether to collect attention at a given layer."""
+        if self.collect_attention_layers is None:
+            return True
+        return layer_idx in self.collect_attention_layers
+
     def forward(
         self, data: HeteroData, return_attention_weights: bool = False,
     ):
         # ---- Input projection ----
         x_dict: Dict[str, Tensor] = {}
         for ntype in self.node_types:
+            store = data[ntype]
+            if not hasattr(store, "x_scalar"):
+                raise ValueError(f"Node type '{ntype}' missing required field 'x_scalar'")
+            if not hasattr(store, "x_text"):
+                raise ValueError(f"Node type '{ntype}' missing required field 'x_text'")
+            if not hasattr(store, "leiden_ids"):
+                raise ValueError(f"Node type '{ntype}' missing required field 'leiden_ids'")
             x_cat = torch.cat([
-                data[ntype].x_scalar,
-                data[ntype].x_text,
-                self.leiden_embedding(data[ntype].leiden_ids),
+                store.x_scalar,
+                store.x_text,
+                self.leiden_embedding(store.leiden_ids),
             ], dim=-1)
             x_dict[ntype] = self.input_proj[ntype](x_cat)
 
@@ -388,18 +485,19 @@ class HeteroRGATEncoder(nn.Module):
         else:
             global_ei = self._global_ei_cache
 
-        all_attn: Dict[str, Tensor] = {}
+        # Structured attention: {layer_idx: {key: alpha_tensor}}
+        all_attn: Dict[int, Dict[str, Tensor]] = {}
 
         for i, (conv, norm_dict) in enumerate(zip(self.convs, self.norms)):
             x_residual = x_dict
 
-            # Only collect attention from the first layer
-            if return_attention_weights and i == 0:
+            collect = return_attention_weights and self._should_collect_attn(i)
+            if collect:
                 x_dict, layer_attn = conv(
                     x_dict, edge_index_dict, global_ei,
                     return_attention_weights=True,
                 )
-                all_attn = layer_attn
+                all_attn[i] = layer_attn
             else:
                 x_dict = conv(x_dict, edge_index_dict, global_ei)
 
@@ -426,30 +524,34 @@ class HeteroRGATEncoder(nn.Module):
 
 
 # ------------------------------------------------------------------ #
-# Attention Diversity Loss                                             #
+# Attention Diversity Loss (v2)                                        #
 # ------------------------------------------------------------------ #
 
 class AttentionDiversityLoss(nn.Module):
-    """3-term diversity loss on actual attention outputs.
+    """Output-based diversity loss with three terms:
 
-    Must be called with gradient-connected attention tensors (not under
-    torch.no_grad) for the loss to influence training.
+    1. **Orthogonality**: penalise cosine similarity between attention heads
+    2. **Variance**: penalise low variance within each head (uniform attention)
+    3. **Coverage**: penalise one head dominating all edges at a destination
+
+    Operates on gradient-connected attention tensors across multiple layers.
+    Falls back to parameter-level loss when no attention is cached.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        ortho_weight: float = 0.5,
+        variance_weight: float = 0.3,
+        coverage_weight: float = 0.2,
+        num_layers: int = 3,
+    ) -> None:
         super().__init__()
-        self.cached_attn: Dict[str, Tensor] = {}
-
-    @staticmethod
-    def _gini(x: Tensor) -> Tensor:
-        sorted_x, _ = torch.sort(x)
-        n = sorted_x.size(0)
-        idx = torch.arange(1, n + 1, dtype=torch.float, device=x.device)
-        total = sorted_x.sum()
-        if total < 1e-12:
-            return torch.tensor(0.0, device=x.device)
-        gini = (2.0 * (idx * sorted_x).sum()) / (n * total) - (n + 1.0) / n
-        return torch.clamp(gini, 0.0, 1.0)
+        self.ortho_weight = ortho_weight
+        self.variance_weight = variance_weight
+        self.coverage_weight = coverage_weight
+        self.num_layers = max(num_layers, 1)
+        # Set by training loop before calling forward
+        self.cached_attn: Dict[int, Dict[str, Tensor]] = {}
 
     def forward(self, encoder: HeteroRGATEncoder) -> Tensor:
         if self.cached_attn:
@@ -457,57 +559,80 @@ class AttentionDiversityLoss(nn.Module):
         return self._param_level_loss(encoder)
 
     def _output_based_loss(self) -> Tensor:
-        device = next(iter(self.cached_attn.values())).device
+        """Compute diversity loss on actual attention outputs (gradient-connected)."""
+        device = None
+        for layer_attn in self.cached_attn.values():
+            for t in layer_attn.values():
+                device = t.device
+                break
+            if device is not None:
+                break
+        if device is None:
+            return torch.tensor(0.0)
+
         total_loss = torch.tensor(0.0, device=device)
-        n_types = 0
+        n_terms = 0
 
-        for _key, attn in self.cached_attn.items():
-            if attn.dim() != 2 or attn.size(1) < 2 or attn.size(0) < 2:
-                continue
+        for layer_idx, layer_attn in self.cached_attn.items():
+            # Deeper layers get higher weight: 0.5 at layer 0, 1.0 at last
+            if self.num_layers > 1:
+                layer_w = 0.5 + 0.5 * (layer_idx / (self.num_layers - 1))
+            else:
+                layer_w = 1.0
 
-            H = attn.size(1)
-            heads = attn.T  # [H, num_edges]
+            for _key, attn in layer_attn.items():
+                if attn.dim() != 2 or attn.size(1) < 2 or attn.size(0) < 2:
+                    continue
 
-            # 1. Entropy loss
-            entropy_loss = torch.tensor(0.0, device=device)
-            for h in range(H):
-                p = F.softmax(heads[h], dim=0)
-                ent = -(p * torch.log(p + 1e-8)).sum()
-                max_ent = torch.log(torch.tensor(float(heads.size(1)), device=device))
-                entropy_loss = entropy_loss + (1.0 - ent / max_ent)
+                H = attn.size(1)    # num heads
+                E = attn.size(0)    # num edges
+                heads = attn.T      # [H, E]
 
-            # 2. Head orthogonality
-            heads_norm = F.normalize(heads, p=2, dim=1, eps=1e-8)
-            sim = torch.mm(heads_norm, heads_norm.t())
-            mask = ~torch.eye(H, dtype=torch.bool, device=device)
-            ortho_loss = (
-                sim[mask].abs().mean()
-                if mask.any()
-                else torch.tensor(0.0, device=device)
-            )
+                # ---- 1. Head orthogonality (primary) ----
+                heads_norm = F.normalize(heads, p=2, dim=1, eps=1e-8)
+                sim = torch.mm(heads_norm, heads_norm.t())  # [H, H]
+                mask = ~torch.eye(H, dtype=torch.bool, device=device)
+                ortho_loss = sim[mask].abs().mean() if mask.any() else torch.tensor(0.0, device=device)
 
-            # 3. Gini sparsity (alternate per head)
-            gini_loss = torch.tensor(0.0, device=device)
-            for h in range(H):
-                p = F.softmax(heads[h], dim=0)
-                g = self._gini(p)
-                if h % 2 == 0:
-                    gini_loss = gini_loss + (1.0 - g)
-                else:
-                    gini_loss = gini_loss + g
+                # ---- 2. Head variance maximisation ----
+                # High variance within a head means peaked attention (good)
+                # Penalise low variance
+                head_var = heads.var(dim=1)       # [H]
+                # Normalise by max possible variance for attention in [0,1]
+                variance_loss = (1.0 - head_var.clamp(max=1.0)).mean()
 
-            edge_loss = 0.3 * entropy_loss + 0.4 * ortho_loss + 0.3 * gini_loss
-            if torch.isfinite(edge_loss):
-                total_loss = total_loss + edge_loss
-                n_types += 1
+                # ---- 3. Complementary coverage ----
+                # For each edge, which head has the max attention?
+                # Penalise if one head dominates across all edges.
+                max_head_per_edge = attn.argmax(dim=1)  # [E]
+                # Compute fraction of edges won by each head
+                coverage_counts = torch.zeros(H, device=device)
+                for h in range(H):
+                    coverage_counts[h] = (max_head_per_edge == h).float().sum()
+                coverage_dist = coverage_counts / (E + 1e-8)
+                # Ideal = uniform (1/H each). Penalise deviation.
+                uniform_target = 1.0 / H
+                coverage_loss = ((coverage_dist - uniform_target).abs()).mean()
 
-        if n_types > 0:
-            total_loss = total_loss / n_types
+                edge_loss = (
+                    self.ortho_weight * ortho_loss
+                    + self.variance_weight * variance_loss
+                    + self.coverage_weight * coverage_loss
+                )
+
+                if torch.isfinite(edge_loss):
+                    total_loss = total_loss + layer_w * edge_loss
+                    n_terms += 1
+
+        if n_terms > 0:
+            total_loss = total_loss / n_terms
         if not torch.isfinite(total_loss):
             total_loss = torch.tensor(0.0, device=device)
         return total_loss
 
     def _param_level_loss(self, encoder: HeteroRGATEncoder) -> Tensor:
+        """Fallback: penalise similar head parameters (not gradient-connected
+        to attention outputs, but better than nothing)."""
         terms: List[Tensor] = []
         for ms_conv in encoder.convs:
             for convs_dict in (ms_conv.local_convs, ms_conv.global_convs):
@@ -550,11 +675,177 @@ class AttentionDiversityLoss(nn.Module):
 
 
 # ------------------------------------------------------------------ #
-# Link Predictor (dot-product decoder)                                 #
+# Relation-Specific Decoder                                            #
+# ------------------------------------------------------------------ #
+
+class RelationDecoder(nn.Module):
+    """Relation-specific link prediction decoder.
+
+    Supports two modes:
+    - ``distmult``: score = (z_src * r_rel * z_dst).sum(-1)
+    - ``bilinear``:  score = z_src^T W_rel z_dst
+
+    Each supervised triplet gets its own relation parameters.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        supervised_triplets: List[Tuple[str, str, str]],
+        decoder_type: str = "distmult",
+    ) -> None:
+        super().__init__()
+        if not supervised_triplets:
+            raise ValueError("RelationDecoder requires at least one supervised triplet")
+
+        self.decoder_type = decoder_type
+        self.hidden_dim = hidden_dim
+        self._triplet_keys: Dict[Tuple[str, str, str], str] = {}
+
+        if decoder_type == "distmult":
+            self.rel_emb = nn.ParameterDict()
+            for triplet in supervised_triplets:
+                key = f"{triplet[0]}__{triplet[1]}__{triplet[2]}"
+                self._triplet_keys[triplet] = key
+                self.rel_emb[key] = nn.Parameter(torch.ones(hidden_dim))
+        elif decoder_type == "bilinear":
+            self.rel_mat = nn.ParameterDict()
+            for triplet in supervised_triplets:
+                key = f"{triplet[0]}__{triplet[1]}__{triplet[2]}"
+                self._triplet_keys[triplet] = key
+                w = torch.empty(hidden_dim, hidden_dim)
+                nn.init.xavier_uniform_(w)
+                self.rel_mat[key] = nn.Parameter(w)
+        else:
+            raise ValueError(f"Unknown decoder_type: {decoder_type!r}. Use 'distmult' or 'bilinear'.")
+
+    def forward(
+        self,
+        z_src: Tensor,
+        z_dst: Tensor,
+        triplet: Tuple[str, str, str],
+    ) -> Tensor:
+        key = self._triplet_keys.get(triplet)
+        if key is None:
+            raise ValueError(
+                f"Triplet {triplet} not registered in decoder. "
+                f"Registered: {list(self._triplet_keys.keys())}"
+            )
+
+        if self.decoder_type == "distmult":
+            r = self.rel_emb[key]
+            return (z_src * r * z_dst).sum(dim=-1)
+        else:
+            W = self.rel_mat[key]
+            return (z_src @ W * z_dst).sum(dim=-1)
+
+
+# ------------------------------------------------------------------ #
+# Legacy LinkPredictor (kept for backward compatibility / ablation)     #
 # ------------------------------------------------------------------ #
 
 class LinkPredictor(nn.Module):
-    """Dot-product link predictor."""
+    """Relation-agnostic dot-product decoder (baseline for ablation)."""
 
     def forward(self, z_src: Tensor, z_dst: Tensor) -> Tensor:
         return (z_src * z_dst).sum(dim=-1)
+
+
+# ------------------------------------------------------------------ #
+# Auxiliary Supervision Heads                                          #
+# ------------------------------------------------------------------ #
+
+class SameRepoHead(nn.Module):
+    """Predict whether two nodes belong to the same repository.
+
+    Takes |z_src - z_dst| as input and outputs a logit.
+    """
+
+    def __init__(self, hidden_dim: int) -> None:
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+        )
+
+    def forward(self, z_src: Tensor, z_dst: Tensor) -> Tensor:
+        diff = (z_src - z_dst).abs()
+        return self.mlp(diff).squeeze(-1)
+
+
+class DegreeBucketHead(nn.Module):
+    """Predict a discretised log-degree bucket for a node.
+
+    Returns logits over `num_buckets` classes.
+    """
+
+    def __init__(self, hidden_dim: int, num_buckets: int = 6) -> None:
+        super().__init__()
+        self.linear = nn.Linear(hidden_dim, num_buckets)
+
+    def forward(self, z: Tensor) -> Tensor:
+        return self.linear(z)
+
+
+# ------------------------------------------------------------------ #
+# Diversity metrics computation (for logging, not loss)                #
+# ------------------------------------------------------------------ #
+
+def compute_diversity_metrics(
+    attn_dict: Dict[int, Dict[str, Tensor]],
+) -> Dict[str, float]:
+    """Compute per-edge-type head diversity metrics for logging.
+
+    Returns a flat dict with keys like:
+        "layer0/local|src|rel|dst/cosine_sim"
+        "layer0/local|src|rel|dst/mean_entropy"
+        "layer0/local|src|rel|dst/mean_variance"
+        "layer0/local|src|rel|dst/avg_pairwise_sim"
+
+    All computations are detached (no gradient flow).
+    """
+    import numpy as np
+
+    metrics: Dict[str, float] = {}
+
+    for layer_idx, layer_attn in attn_dict.items():
+        for key, attn in layer_attn.items():
+            if attn.dim() != 2 or attn.size(1) < 2:
+                continue
+
+            attn_np = attn.detach().cpu()
+            H = attn_np.size(1)
+            heads = attn_np.T  # [H, E]
+
+            prefix = f"layer{layer_idx}/{key}"
+
+            # 1. Mean pairwise cosine similarity
+            heads_norm = F.normalize(heads, p=2, dim=1, eps=1e-8)
+            sim = torch.mm(heads_norm, heads_norm.t())
+            mask = ~torch.eye(H, dtype=torch.bool)
+            if mask.any():
+                cos_sim = sim[mask].abs().mean().item()
+                avg_sim = sim[mask].mean().item()
+            else:
+                cos_sim = 0.0
+                avg_sim = 0.0
+            metrics[f"{prefix}/cosine_sim"] = cos_sim
+            metrics[f"{prefix}/avg_pairwise_sim"] = avg_sim
+
+            # 2. Mean entropy per head
+            entropies = []
+            for h in range(H):
+                p = F.softmax(heads[h], dim=0)
+                ent = -(p * torch.log(p + 1e-8)).sum()
+                max_ent = math.log(heads.size(1)) if heads.size(1) > 1 else 1.0
+                entropies.append((ent / max_ent).item())
+            metrics[f"{prefix}/mean_entropy"] = float(np.mean(entropies))
+
+            # 3. Mean variance per head
+            variances = []
+            for h in range(H):
+                variances.append(heads[h].var().item())
+            metrics[f"{prefix}/mean_variance"] = float(np.mean(variances))
+
+    return metrics

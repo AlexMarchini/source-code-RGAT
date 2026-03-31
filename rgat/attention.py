@@ -1,10 +1,9 @@
 """
 rgat.attention – Utilities for extracting attention weights from the encoder.
 
-After training, attention weights reveal which edges (relationships) the
-model considers most important.  This module provides hook-based capture
-so you can inspect per-layer, per-edge-type, per-scale attention
-coefficients without modifying the encoder's ``forward()`` method.
+v2: Uses the encoder's native multi-layer attention output instead of
+manually replaying the forward pass.  The encoder now returns structured
+attention as ``Dict[int, Dict[str, Tensor]]`` (layer_idx → key → alpha).
 
 Each attention entry is keyed by a 4-tuple
 ``(src_type, rel, dst_type, scale)`` where ``scale`` is either
@@ -14,7 +13,7 @@ Each attention entry is keyed by a 4-tuple
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, TYPE_CHECKING, Tuple
+from typing import Any, Dict, List, TYPE_CHECKING, Tuple
 
 import torch
 from torch import Tensor
@@ -31,6 +30,15 @@ AttentionMap = Dict[
     Tuple[str, str, str, str],
     Tuple[Tensor, Tensor],          # (edge_index, alpha)
 ]
+
+
+def _parse_attn_key(key: str) -> Tuple[str, str, str, str]:
+    """Parse 'local|src_type|rel|dst_type' → (src_type, rel, dst_type, scale)."""
+    parts = key.split("|")
+    if len(parts) != 4:
+        raise ValueError(f"Unexpected attention key format: {key!r}")
+    scale, src_type, rel, dst_type = parts
+    return (src_type, rel, dst_type, scale)
 
 
 def get_attention_weights(
@@ -56,129 +64,75 @@ def get_attention_weights(
 
     Notes
     -----
-    Performs a manual two-scale extraction that mirrors
-    :class:`~rgat.model.MultiScaleHeteroConv` forward logic: each
-    sub-conv (local branch, then global branch) is called individually
-    with ``return_attention_weights=True`` so heads within each scale
-    can be inspected independently.
+    Uses the encoder's native ``return_attention_weights=True`` to collect
+    attention from all layers in a single forward pass.  To get attention
+    from specific layers only, configure ``encoder.collect_attention_layers``.
     """
-    import torch.nn.functional as F
-
     encoder.eval()
     device = next(encoder.parameters()).device
     data = data.to(device)
 
-    from rgat.model import _structural_global_edges
+    # Temporarily collect from all layers for complete extraction
+    original_layers = encoder.collect_attention_layers
+    encoder.collect_attention_layers = None  # all layers
 
-    # ── Reproduce input projection (same as encoder.forward) ──────────
     with torch.no_grad():
-        x_dict: Dict[str, Tensor] = {}
-        for ntype in encoder.node_types:
-            x_scalar = data[ntype].x_scalar
-            x_text = data[ntype].x_text
-            leiden_ids = data[ntype].leiden_ids
-            x_leiden = encoder.leiden_embedding(leiden_ids)
-            x_cat = torch.cat([x_scalar, x_text, x_leiden], dim=-1)
-            x_dict[ntype] = F.elu(encoder.input_proj[ntype](x_cat))
+        z_dict, all_attn = encoder(data, return_attention_weights=True)
 
-        edge_index_dict = {
-            et: data[et].edge_index
-            for et in encoder.edge_types
-            if hasattr(data[et], "edge_index")
-        }
+    # Restore original setting
+    encoder.collect_attention_layers = original_layers
 
-        # Build the same global edge index the encoder uses at runtime
-        global_edge_index_dict: Dict = {}
-        for et, ei in edge_index_dict.items():
-            src_type, _, dst_type = et
-            n_src = data[src_type].num_nodes
-            n_dst = data[dst_type].num_nodes
-            global_edge_index_dict[et] = _structural_global_edges(ei, n_src, n_dst)
+    # Build edge index dicts for reference (needed for the attention maps)
+    edge_index_dict = {
+        et: data[et].edge_index
+        for et in encoder.edge_types
+        if hasattr(data[et], "edge_index")
+    }
 
-        per_layer_attn: List[AttentionMap] = []
+    # Build global edge index dict (same logic as encoder)
+    from rgat.model import _structural_global_edges
+    global_edge_index_dict: Dict = {}
+    for et, ei in edge_index_dict.items():
+        src_type, _, dst_type = et
+        n_src = data[src_type].num_nodes
+        n_dst = data[dst_type].num_nodes
+        global_edge_index_dict[et] = _structural_global_edges(ei, n_src, n_dst)
 
-        for layer_idx, (ms_conv, norm_dict) in enumerate(
-            zip(encoder.convs, encoder.norms)
-        ):
-            layer_attn: AttentionMap = {}
-            x_residual = x_dict
+    # Convert structured attention to List[AttentionMap] format
+    num_layers = encoder.num_layers
+    per_layer_attn: List[AttentionMap] = []
 
-            # ── LOCAL PASS: 1-hop sub-convs ────────────────────────────
-            local_out_dict: Dict[str, List[Tensor]] = {}
-            for et in ms_conv.edge_types:
-                key = ms_conv._et_keys[et]
-                src_type, rel, dst_type = et
-                if et not in edge_index_dict:
+    for layer_idx in range(num_layers):
+        layer_attn: AttentionMap = {}
+
+        if layer_idx in all_attn:
+            raw_layer = all_attn[layer_idx]
+            for key, alpha in raw_layer.items():
+                src_type, rel, dst_type, scale = _parse_attn_key(key)
+                et = (src_type, rel, dst_type)
+
+                # Determine the right edge index for this entry
+                if scale == "local":
+                    ei = edge_index_dict.get(et)
+                else:
+                    ei = global_edge_index_dict.get(et)
+
+                if ei is None:
                     continue
-                ei = edge_index_dict[et]
-                sub_conv = ms_conv.local_convs[key]
-                result = sub_conv(
-                    (x_dict[src_type], x_dict[dst_type]), ei,
-                    return_attention_weights=True,
+
+                # For GATConv with return_attention_weights, the edge index
+                # returned may include self-loops. We need to handle the
+                # case where alpha has more entries than the original ei.
+                # Since we can't get the exact edge_index from the conv
+                # (it's inside no_grad), we reconstruct from the alpha size.
+                # The alpha tensor has [num_edges_with_self_loops, num_heads].
+                # We store both the original edge_index and the alpha.
+                layer_attn[(src_type, rel, dst_type, scale)] = (
+                    ei.cpu(),
+                    alpha.cpu(),
                 )
-                if isinstance(result, tuple) and len(result) == 2:
-                    out_feat, attn_info = result
-                    if isinstance(attn_info, tuple) and len(attn_info) == 2:
-                        layer_attn[(src_type, rel, dst_type, "local")] = (
-                            attn_info[0].cpu(),
-                            attn_info[1].cpu(),
-                        )
-                else:
-                    out_feat = result
-                local_out_dict.setdefault(dst_type, []).append(out_feat)
 
-            # Assemble h_local (sum contributions, identity for unseen types)
-            h_local: Dict[str, Tensor] = {}
-            for ntype in encoder.node_types:
-                parts = local_out_dict.get(ntype, [])
-                if parts:
-                    h_local[ntype] = torch.stack(parts, dim=0).sum(dim=0)
-                else:
-                    h_local[ntype] = x_dict[ntype]
-
-            # ── GLOBAL PASS: augmented sub-convs (operate on x_dict) ───
-            global_out_dict: Dict[str, List[Tensor]] = {}
-            for et in ms_conv.edge_types:
-                key = ms_conv._et_keys[et]
-                src_type, rel, dst_type = et
-                if et not in global_edge_index_dict:
-                    continue
-                ei = global_edge_index_dict[et]
-                sub_conv = ms_conv.global_convs[key]
-                result = sub_conv(
-                    (x_dict[src_type], x_dict[dst_type]), ei,
-                    return_attention_weights=True,
-                )
-                if isinstance(result, tuple) and len(result) == 2:
-                    out_feat, attn_info = result
-                    if isinstance(attn_info, tuple) and len(attn_info) == 2:
-                        layer_attn[(src_type, rel, dst_type, "global")] = (
-                            attn_info[0].cpu(),
-                            attn_info[1].cpu(),
-                        )
-                else:
-                    out_feat = result
-                global_out_dict.setdefault(dst_type, []).append(out_feat)
-
-            per_layer_attn.append(layer_attn)
-
-            # ── Combine + norm + residual (mirrors MultiScaleHeteroConv) ─
-            is_last = (layer_idx == len(encoder.convs) - 1)
-            new_x: Dict[str, Tensor] = {}
-            for ntype in encoder.node_types:
-                loc = h_local.get(ntype, x_dict[ntype])
-                glb_parts = global_out_dict.get(ntype, [])
-                glb = (
-                    torch.stack(glb_parts, dim=0).sum(dim=0)
-                    if glb_parts else loc
-                )
-                h = ms_conv.scale_combine[ntype](torch.cat([loc, glb], dim=-1))
-                h = norm_dict[ntype](h)
-                h = h + x_residual[ntype]
-                if not is_last:
-                    h = F.elu(h)
-                new_x[ntype] = h
-            x_dict = new_x
+        per_layer_attn.append(layer_attn)
 
     return per_layer_attn
 
@@ -216,9 +170,13 @@ def attention_to_dataframe(
             n_edges = edge_index.shape[1]
             n_heads = alpha.shape[1] if alpha.dim() == 2 else 1
 
+            # alpha may have more entries than edge_index (self-loops added
+            # by GATConv). Only iterate up to min of both.
+            n_iter = min(n_edges, alpha.shape[0])
+
             for head in range(n_heads):
                 head_alpha = alpha[:, head] if alpha.dim() == 2 else alpha
-                for e in range(n_edges):
+                for e in range(n_iter):
                     row = {
                         "layer": layer_idx,
                         "scale": scale,
