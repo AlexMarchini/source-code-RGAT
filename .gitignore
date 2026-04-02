@@ -1,1 +1,7 @@
 django_ecosystem*
+cache/
+artifacts/
+checkpoints/
+*.pyc
+rgat_multiscale.py
+rgat_source.zip
