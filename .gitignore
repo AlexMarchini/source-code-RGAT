@@ -5,3 +5,4 @@ checkpoints/
 *.pyc
 rgat_multiscale.py
 rgat_source.zip
+model_output/
