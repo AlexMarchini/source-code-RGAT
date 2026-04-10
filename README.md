@@ -217,3 +217,9 @@ graph = GraphBuilder(
 graph.write_json("graph.json")
 print(graph.summary())
 ```
+
+## AI Use Disclosure
+
+AI-assisted tools were used in a limited and supportive capacity during the preparation of this work. Large language models (LLMs) were used to assist with drafting, editing, and refining written text, including improving clarity, grammar, and formatting. AI tools were also used to assist with LaTeX formatting and organization of tables and figures.
+
+All technical design decisions, model architecture, data processing, experimentation, and analysis were performed by the author. AI tools were not used to generate core research ideas, experimental results, or conclusions. The author reviewed and verified all content to ensure accuracy and integrity.
